@@ -642,6 +642,7 @@ def monitor_position(inst_id, pos_info):
     current_price = float(d["data"][0]["last"]) if d.get("data") else pos["avgPx"]
     
     upl = pos["upl"]
+    pos_info["last_upl"] = upl  # 记录最新upl，用于CLOSED状态判断盈亏
     elapsed = time.time() - open_time
     
     if direction == "LONG":
@@ -664,16 +665,20 @@ def monitor_position(inst_id, pos_info):
         pos_info["trail_activated"] = True
         log(f"🔔 {inst_id} 追踪止损激活! 浮盈{pct_change:+.2f}% > {TRAIL_ACTIVATE*100}%")
     
-    # 软止盈 — 浮盈超3%且开始回落（从最高点回撤1%）
-    if pct_change >= TP_PCT * 50 and pct_change < pos_info.get("highest_pnl_pct", 0) - 0.5:
-        log(f"💰 {inst_id} 止盈回落! 浮盈{pct_change:+.2f}% (最高{pos_info['highest_pnl_pct']:+.2f}%) → 平仓")
+    # 软止盈 — 浮盈超TRAIL_ACTIVATE阈值且回撤超过追踪止损距离
+    # 作为追踪止损的安全网：正常情况下trail先触发，此处兜底
+    soft_tp_activate = TRAIL_ACTIVATE * 100  # 1.5%
+    soft_tp_pullback = TRAIL_DISTANCE * 100  # 0.8%
+    if pct_change >= soft_tp_activate and pct_change < pos_info.get("highest_pnl_pct", 0) - soft_tp_pullback:
+        log(f"💰 {inst_id} 止盈回落! 浮盈{pct_change:+.2f}% (最高{pos_info['highest_pnl_pct']:+.2f}% 回撤>{soft_tp_pullback}%) → 平仓")
         close_position(inst_id, pos_info.get("algo_ids"))
         return "PROFIT"
     
-    # 硬止盈 — 只在追踪止损未激活时生效（防回落保护）
-    # 追踪止损激活后由trail管理利润，不再硬止盈
-    if not pos_info.get("trail_activated") and pct_change >= TP_PCT * 100:
-        log(f"💰 {inst_id} 硬止盈{pct_change:+.3f}% >= {TP_PCT*100}% → 平仓落袋")
+    # 紧急止盈 — 浮盈达到TP_PCT*2（6%）时立即落袋，防暴涨后回撤
+    # 追踪止损管理1.5%-6%的利润区间，紧急止盈捕获极端利润
+    emergency_tp = TP_PCT * 200  # 6%
+    if pct_change >= emergency_tp:
+        log(f"🚀 {inst_id} 紧急止盈{pct_change:+.3f}% >= {emergency_tp}% → 立即落袋")
         close_position(inst_id, pos_info.get("algo_ids"))
         return "PROFIT"
     
@@ -779,6 +784,21 @@ def main():
                         continue
                     
                     if result in ("PROFIT", "TRAIL_STOP", "TIME_STOP", "CLOSED"):
+                        # CLOSED状态：查询last_upl判断盈亏（algo单触发的平仓）
+                        if result == "CLOSED":
+                            pos_upl = positions[inst_id].get("last_upl", 0)
+                            if pos_upl >= 0:
+                                state["consecutive_losses"] = 0
+                                state["total_pnl"] = state.get("total_pnl", 0) + 1
+                                log(f"  📊 {inst_id} CLOSED(盈利) upl=${pos_upl:.4f}")
+                            else:
+                                state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+                                if state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
+                                    pause_until = datetime.now() + timedelta(seconds=LOSS_PAUSE_SEC)
+                                    state["pause_until"] = pause_until.isoformat()
+                                    log(f"⏸️ {state['consecutive_losses']}连亏，暂停{LOSS_PAUSE_SEC//60}分钟")
+                                log(f"  📊 {inst_id} CLOSED(亏损) upl=${pos_upl:.4f}")
+                        
                         with positions_lock:
                             if inst_id in positions:
                                 del positions[inst_id]
@@ -811,6 +831,14 @@ def main():
                             close_position(inst_id, positions[inst_id].get("algo_ids"))
                             if not get_position(inst_id):
                                 break
+                        # 安全检查平仓记录为亏损（无法判断盈亏，默认触发连亏保护）
+                        state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+                        if state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
+                            pause_until = datetime.now() + timedelta(seconds=LOSS_PAUSE_SEC)
+                            state["pause_until"] = pause_until.isoformat()
+                            log(f"⏸️ 安全平仓{inst_id}，{state['consecutive_losses']}连亏，暂停{LOSS_PAUSE_SEC//60}分钟")
+                        state["last_trade"][inst_id] = time.time()
+                        save_state(state)
                         with positions_lock:
                             if inst_id in positions:
                                 del positions[inst_id]
