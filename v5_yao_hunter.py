@@ -666,15 +666,6 @@ def monitor_position(inst_id, pos_info):
         pos_info["trail_activated"] = True
         log(f"🔔 {inst_id} 追踪止损激活! 浮盈{pct_change:+.2f}% > {TRAIL_ACTIVATE*100}%")
     
-    # 软止盈 — 浮盈超TRAIL_ACTIVATE阈值且回撤超过追踪止损距离
-    # 作为追踪止损的安全网：正常情况下trail先触发，此处兜底
-    soft_tp_activate = TRAIL_ACTIVATE * 100  # 1.5%
-    soft_tp_pullback = TRAIL_DISTANCE * 100  # 0.8%
-    if pct_change >= soft_tp_activate and pct_change < pos_info.get("highest_pnl_pct", 0) - soft_tp_pullback:
-        log(f"💰 {inst_id} 止盈回落! 浮盈{pct_change:+.2f}% (最高{pos_info['highest_pnl_pct']:+.2f}% 回撤>{soft_tp_pullback}%) → 平仓")
-        close_position(inst_id, pos_info.get("algo_ids"))
-        return "PROFIT"
-    
     # 紧急止盈 — 浮盈达到TP_PCT*2（6%）时立即落袋，防暴涨后回撤
     # 追踪止损管理1.5%-6%的利润区间，紧急止盈捕获极端利润
     emergency_tp = TP_PCT * 200  # 6%
