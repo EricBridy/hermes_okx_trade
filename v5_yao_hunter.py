@@ -733,7 +733,8 @@ def main():
                 "entry_price": entry_price, "sz": int(abs(pos_val)),
                 "algo_ids": matched_algos, "open_time": time.time(),
                 "notional": notional, "trail_activated": False,
-                "highest_pnl_pct": 0, "fr": 0
+                "highest_pnl_pct": 0, "fr": 0,
+                "last_upl": float(p.get("upl", 0))  # 恢复时初始化upl用于CLOSED盈亏判断
             }
             algo_status = f" algo={len(matched_algos)}" if matched_algos else " ⚠️无挂单"
             log(f"  📥 {inst_id} {direction} {int(abs(pos_val))}张 @ ${entry_price}{algo_status}")
