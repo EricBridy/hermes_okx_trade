@@ -17,7 +17,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 LEVERAGE = 5
 TP_PCT = 0.03          # 3% 止盈（妖币行情大）
 SL_PCT = 0.015         # 1.5% 止损
-CRASH_SL_PCT = 0.025   # 2.5% 暴跌止损（已移除algo挂单，仅保留常量供参考）
 TRAIL_ACTIVATE = 0.015  # 浮盈1.5%后启动追踪止损
 TRAIL_DISTANCE = 0.008  # 追踪止损距离0.8%
 TIME_STOP_SEC = 600     # 10分钟时间止损（妖币行情需要更多时间）
