@@ -5,7 +5,7 @@ OKX 妖币猎手 v5.1 — 反向猎杀策略
 
 妖币特征：
 1. 资金费率极端（|rate| > 0.03%）→ 散户集中做多/做空
-2. 成交量暴增（相对均量150%+）→ 主力开始行动
+2. 成交量暴增（相对均量130%+）→ 主力开始行动
 3. 反向开仓：费率极端负→做多（爆空），费率极端正→做空（爆多）
 """
 
@@ -28,14 +28,16 @@ LOSS_PAUSE_SEC = 1800
 
 # 妖币筛选阈值
 FUNDING_RATE_EXTREME = 0.0003   # |费率| > 0.03% 视为极端
-VOLUME_SPIKE_RATIO = 1.1        # 成交量 > 均量110% 视为放量
+FUNDING_RATE_ULTRA = 0.001      # |费率| > 0.1% 视为超级极端（重仓）
+ULTRA_POSITION_MULT = 1.5       # 超级极端费率仓位倍数
+VOLUME_SPIKE_RATIO = 1.3        # 成交量 > 均量130% 视为放量
 MIN_24H_VOL = 1000000           # 最小24h成交量 $100万
 MIN_PRICE = 0.001               # 最低价格
 MAX_FUNDING_RATE = 0.01         # |费率| > 1% 跳过（太极端可能有陷阱）
 OKX_TAKER_FEE = 0.0005          # 0.05% taker fee per side
 ROUND_TRIP_FEE = OKX_TAKER_FEE * 2  # 0.1% round trip
 
-# 链上数据配置（Binance Web3 公开API，无需认证）
+TIME_STOP_SEC = 900     # 15分钟时间止损（给妖币更多时间）
 CHAIN_DATA_TTL = 60        # 链上数据60秒刷新一次
 CHAIN_BONUS = 2            # 链上数据匹配的加分值
 CHAIN_API_BASE = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct"
@@ -905,9 +907,14 @@ def main():
                         n_open = min(len(cooled), slots)
                         # 修正：只除以新开仓数（已有仓位的保证金已被占用，availBal已扣除）
                         # 留5%缓冲防手续费/精度导致的余额不足
-                        per_slot = balance * 0.95 / max(n_open, 1)
-                        if per_slot >= 1:
+                        base_slot = balance * 0.95 / max(n_open, 1)
+                        if base_slot >= 1:
                             for cand in cooled[:n_open]:
+                                # 费率分层：超级极端(>0.1%)给予1.5倍仓位
+                                per_slot = base_slot
+                                if cand["abs_fr"] >= FUNDING_RATE_ULTRA:
+                                    per_slot = min(base_slot * ULTRA_POSITION_MULT, balance * 0.95)
+                                    log(f"  💎 {cand['sym']} 超级极端费率{cand['fr']*100:+.4f}% → 1.5倍仓位${per_slot:.2f}")
                                 log(f"🔥 妖币开仓: {cand['sym']} {cand['dir']} FR={cand['fr']*100:+.4f}% vol={cand['vol_ratio']:.1f}x")
                                 pos = open_position(cand["sym"], cand["dir"], per_slot)
                                 if pos:
