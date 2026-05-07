@@ -29,7 +29,7 @@ LOSS_PAUSE_SEC = 1800
 
 # 妖币筛选阈值
 FUNDING_RATE_EXTREME = 0.0003   # |费率| > 0.03% 视为极端
-VOLUME_SPIKE_RATIO = 1.3        # 成交量 > 均量130% 视为放量
+VOLUME_SPIKE_RATIO = 1.1        # 成交量 > 均量110% 视为放量
 MIN_24H_VOL = 1000000           # 最小24h成交量 $100万
 MIN_PRICE = 0.001               # 最低价格
 MAX_FUNDING_RATE = 0.01         # |费率| > 1% 跳过（太极端可能有陷阱）
@@ -40,11 +40,7 @@ ROUND_TRIP_FEE = OKX_TAKER_FEE * 2  # 0.1% round trip
 CHAIN_DATA_TTL = 60        # 链上数据60秒刷新一次
 CHAIN_BONUS = 2            # 链上数据匹配的加分值
 CHAIN_API_BASE = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct"
-CHAIN_HEADERS = {
-    "Content-Type": "application/json",
-    "Accept-Encoding": "identity",
-    "User-Agent": "binance-web3/2.1 (Skill)"
-}
+
 
 # 时间窗口 (UTC+8) — 24小时
 TRADING_WINDOWS = [(0, 0, 23, 59)]
@@ -289,12 +285,7 @@ def is_near_settlement():
             return True, int(diff)
     return False, 0
 
-def should_hold_through_settlement(fr, direction):
-    if direction == "LONG" and fr < 0:
-        return True
-    elif direction == "SHORT" and fr > 0:
-        return True
-    return False
+
 
 # ==================== 合约规格缓存 ====================
 def load_instruments_cache():
@@ -336,23 +327,7 @@ def get_funding_rates_batch(syms):
                 results[sym] = rate
     return results
 
-def get_open_interest_batch(syms):
-    """并行获取持仓量"""
-    results = {}
-    def get_oi(sym):
-        try:
-            d = curl_json(f"https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId={sym}", 5)
-            if d.get("code") == "0" and d.get("data"):
-                return sym, float(d["data"][0].get("oi", 0))
-        except:
-            pass
-        return sym, None
-    
-    with ThreadPoolExecutor(max_workers=15) as ex:
-        for sym, oi in ex.map(get_oi, syms):
-            if oi is not None:
-                results[sym] = oi
-    return results
+
 
 # ==================== 妖币扫描 ====================
 def scan_yao_market():
@@ -504,15 +479,16 @@ def close_position(inst_id, algo_ids=None):
     if not pos:
         return {"code": "0", "msg": "already closed"}
     
+    # Fix: 先取消algo挂单，再市价平仓
+    if algo_ids:
+        for aid in algo_ids:
+            okx_post("/api/v5/trade/cancel-algos", json.dumps([{"instId": inst_id, "algoId": aid}]))
+    
     side = "sell" if pos["pos"] > 0 else "buy"
     r = okx_post("/api/v5/trade/order", json.dumps({
         "instId": inst_id, "tdMode": "cross",
         "side": side, "ordType": "market", "sz": str(int(abs(pos["pos"])))
     }))
-    
-    if algo_ids:
-        for aid in algo_ids:
-            okx_post("/api/v5/trade/cancel-algos", json.dumps([{"instId": inst_id, "algoId": aid}]))
     
     return r
 
@@ -649,7 +625,7 @@ def open_position(inst_id, direction, balance_for_trade):
         "instId": inst_id, "direction": direction,
         "entry_price": avg, "sz": sz,
         "algo_ids": algo_ids, "open_time": time.time(),
-        "notional": notional_max, "trail_activated": False,
+        "notional": notional_actual, "trail_activated": False,
         "highest_pnl_pct": 0, "fr": 0
     }
 
@@ -818,9 +794,15 @@ def main():
                         tag_str = f" [{','.join(chain_tags)}]" if chain_tags else ""
                         log(f"    {c['sym']} {'↑多' if c['dir']=='LONG' else '↓空'} FR={fr_pct:+.4f}% vol24h=${c['vol24h']/1e6:.1f}M{tag_str}")
                     
-                    # 检查放量（取前3个候选）
+                    # 检查放量（取前5个候选）
                     confirmed = []
                     for c in candidates[:5]:
+                        # 费率>0.1%（极端）跳过放量检查，直接确认
+                        if c["abs_fr"] >= 0.001:
+                            c["vol_ratio"] = 99  # 标记为极端信号
+                            confirmed.append(c)
+                            log(f"  🔥 {c['sym']} 极端费率{c['fr']*100:+.4f}% 跳过放量检查")
+                            continue
                         is_spike, ratio = check_volume_spike(c["sym"])
                         if is_spike:
                             c["vol_ratio"] = ratio
