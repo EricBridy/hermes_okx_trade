@@ -1,0 +1,11 @@
+# State and cache
+v4_state.json
+__pycache__/
+*.pyc
+
+# Logs (contain trading history, not code)
+v4_trades.log
+*.log
+
+# Backup files
+*.bak.*
