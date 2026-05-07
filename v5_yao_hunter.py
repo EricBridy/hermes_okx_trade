@@ -47,7 +47,6 @@ TRADING_WINDOWS = [(0, 0, 23, 59)]
 
 # ==================== 缓存 ====================
 INSTRUMENTS_CACHE = {}
-MAX_LEVERAGE_CACHE = {}  # instId -> max leverage
 FR_HISTORY = {}  # instId -> [last_fr, timestamp] for persistence check
 FR_HISTORY_TTL = 300  # 5 minute window for persistence
 SKIP_SYMS = {"RLS-USDT-SWAP", "BILL-USDT-SWAP"}
@@ -303,7 +302,6 @@ def load_instruments_cache():
                     "maxLev": max_lev,
                     "tickSz": inst.get("tickSz", "0.00001"),
                 }
-                MAX_LEVERAGE_CACHE[inst_id] = int(max_lev)
             log(f"✅ 合约规格缓存: {len(INSTRUMENTS_CACHE)}个")
     except Exception as e:
         log(f"⚠️ 缓存加载失败: {e}")
@@ -619,7 +617,7 @@ def open_position(inst_id, direction, balance_for_trade):
             log(f"🚨 {inst_id} 平仓3次失败！需手动处理")
         return None
     
-    log(f"✅ 开{'多' if direction=='LONG' else '空'} {inst_id} {sz}张 @ ${avg} TP=${tp} SL=${sl} FR={positions.get(inst_id, {}).get('fr', 'N/A')}")
+    log(f"✅ 开{'多' if direction=='LONG' else '空'} {inst_id} {sz}张 @ ${avg} TP=${tp} SL=${sl}")
     
     return {
         "instId": inst_id, "direction": direction,
@@ -672,9 +670,10 @@ def monitor_position(inst_id, pos_info):
         close_position(inst_id, pos_info.get("algo_ids"))
         return "PROFIT"
     
-    # 硬止盈
-    if upl > pos_info["notional"] * 0.015:
-        log(f"💰 {inst_id} 浮盈${upl:.4f} ({pct_change:+.3f}%) → 平仓落袋")
+    # 硬止盈 — 只在追踪止损未激活时生效（防回落保护）
+    # 追踪止损激活后由trail管理利润，不再硬止盈
+    if not pos_info.get("trail_activated") and pct_change >= TP_PCT * 100:
+        log(f"💰 {inst_id} 硬止盈{pct_change:+.3f}% >= {TP_PCT*100}% → 平仓落袋")
         close_position(inst_id, pos_info.get("algo_ids"))
         return "PROFIT"
     
@@ -700,14 +699,53 @@ def main():
     state = load_state()
     scan_count = 0
     
-    # Fix: Cancel ALL stale algo orders from previous sessions
-    log("🧹 清理残留algo挂单...")
-    stale_algos = okx_get("/api/v5/trade/orders-algo-pending?ordType=conditional")
-    if stale_algos.get("data"):
-        for a in stale_algos["data"]:
-            r = okx_post("/api/v5/trade/cancel-algos", json.dumps([{"instId": a["instId"], "algoId": a["algoId"]}]))
-            log(f"  取消 {a['instId']} algoId={a['algoId']}: {r.get('code')}")
-        log(f"  共清理 {len(stale_algos['data'])} 个残留挂单")
+    # Step 1: Query ALL pending algo orders first (before any cleanup)
+    log("📥 加载已有持仓和挂单...")
+    all_pending_algos = okx_get("/api/v5/trade/orders-algo-pending?ordType=conditional")
+    algo_map = {}  # instId -> [algoId, ...]
+    if all_pending_algos.get("data"):
+        for a in all_pending_algos["data"]:
+            aid_inst = a.get("instId", "")
+            if aid_inst not in algo_map:
+                algo_map[aid_inst] = []
+            algo_map[aid_inst].append(a["algoId"])
+    
+    # Step 2: Load existing positions and match with algos
+    existing = get_all_positions()
+    protected_inst_ids = set()
+    if existing:
+        for p in existing:
+            inst_id = p["instId"]
+            protected_inst_ids.add(inst_id)
+            pos_val = p["pos"]
+            direction = "LONG" if pos_val > 0 else "SHORT"
+            entry_price = p["avgPx"]
+            specs = INSTRUMENTS_CACHE.get(inst_id, {})
+            notional = abs(pos_val) * specs.get("ctVal", 1) * entry_price
+            matched_algos = algo_map.get(inst_id, [])
+            positions[inst_id] = {
+                "instId": inst_id, "direction": direction,
+                "entry_price": entry_price, "sz": int(abs(pos_val)),
+                "algo_ids": matched_algos, "open_time": time.time(),
+                "notional": notional, "trail_activated": False,
+                "highest_pnl_pct": 0, "fr": 0
+            }
+            algo_status = f" algo={len(matched_algos)}" if matched_algos else " ⚠️无挂单"
+            log(f"  📥 {inst_id} {direction} {int(abs(pos_val))}张 @ ${entry_price}{algo_status}")
+        log(f"  共加载 {len(existing)} 个持仓")
+    else:
+        log("  无持仓")
+    
+    # Step 3: Cancel stale algos that DON'T belong to any recovered position
+    stale_count = 0
+    for inst_id, algos in algo_map.items():
+        if inst_id not in protected_inst_ids:
+            for aid in algos:
+                r = okx_post("/api/v5/trade/cancel-algos", json.dumps([{"instId": inst_id, "algoId": aid}]))
+                log(f"  🧹 清理残留: {inst_id} algoId={aid}: {r.get('code')}")
+                stale_count += 1
+    if stale_count:
+        log(f"  共清理 {stale_count} 个残留挂单")
     else:
         log("  无残留挂单")
     
@@ -827,12 +865,14 @@ def main():
                         
                         if not cooled:
                             log(f"  ⏳ 所有候选品种均在冷却中")
+                            time.sleep(SCAN_INTERVAL)
                             continue
                         
                         # Check settlement proximity
                         near_settle, settle_secs = is_near_settlement()
                         if near_settle:
                             log(f"  ⏳ 距资金费率结算仅{settle_secs//60}分钟，暂停开仓")
+                            time.sleep(60)
                             continue
                         
                         n_open = min(len(cooled), slots)
