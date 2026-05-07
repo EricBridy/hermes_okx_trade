@@ -791,7 +791,7 @@ def main():
                                     pause_until = datetime.now() + timedelta(seconds=LOSS_PAUSE_SEC)
                                     state["pause_until"] = pause_until.isoformat()
                                     log(f"⏸️ {state['consecutive_losses']}连亏，暂停{LOSS_PAUSE_SEC//60}分钟")
-                                log(f"  📊 {inst_id} CLOSED(亏损) upl=${pos_upl:.4f}")
+                                log(f"  📊 {inst_id} CLOSED(亏损) upl=${pos_upl if pos_upl else 'N/A'}")
                         
                         with positions_lock:
                             if inst_id in positions:
