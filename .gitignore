@@ -9,3 +9,8 @@ v4_trades.log
 
 # Backup files
 *.bak.*
+
+# v5 specific
+v5_state.json
+v5_trades.log
+*.bak
