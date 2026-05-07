@@ -624,7 +624,8 @@ def open_position(inst_id, direction, balance_for_trade):
         "entry_price": avg, "sz": sz,
         "algo_ids": algo_ids, "open_time": time.time(),
         "notional": notional_actual, "trail_activated": False,
-        "highest_pnl_pct": 0, "fr": 0
+        "highest_pnl_pct": 0, "fr": 0,
+        "last_upl": 0  # 首次monitor前为0，CLOSED时保守判定
     }
 
 # ==================== 持仓监控（带追踪止损） ====================
@@ -787,12 +788,13 @@ def main():
                     if result in ("PROFIT", "TRAIL_STOP", "TIME_STOP", "CLOSED"):
                         # CLOSED状态：查询last_upl判断盈亏（algo单触发的平仓）
                         if result == "CLOSED":
-                            pos_upl = positions[inst_id].get("last_upl", 0)
-                            if pos_upl >= 0:
+                            pos_upl = positions[inst_id].get("last_upl", None)
+                            if pos_upl is not None and pos_upl > 0:
                                 state["consecutive_losses"] = 0
                                 state["total_pnl"] = state.get("total_pnl", 0) + 1
                                 log(f"  📊 {inst_id} CLOSED(盈利) upl=${pos_upl:.4f}")
                             else:
+                                # last_upl为None/0说明没读到实际upl，保守算亏损
                                 state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
                                 if state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
                                     pause_until = datetime.now() + timedelta(seconds=LOSS_PAUSE_SEC)
