@@ -879,6 +879,10 @@ def main():
                         now_ts = time.time()
                         cooled = []
                         for c in confirmed:
+                            # 防止重复开仓：已持仓品种跳过
+                            if c["sym"] in positions:
+                                log(f"  ⏳ {c['sym']} 已有持仓，跳过")
+                                continue
                             last = state.get("last_trade", {}).get(c["sym"], 0)
                             if now_ts - last < COOLDOWN_SEC:
                                 remaining = int(COOLDOWN_SEC - (now_ts - last))
