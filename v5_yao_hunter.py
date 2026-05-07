@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 LEVERAGE = 5
 TP_PCT = 0.03          # 3% 止盈（妖币行情大）
 SL_PCT = 0.015         # 1.5% 止损
-CRASH_SL_PCT = 0.025   # 2.5% 暴跌止损
+CRASH_SL_PCT = 0.025   # 2.5% 暴跌止损（已移除algo挂单，仅保留常量供参考）
 TRAIL_ACTIVATE = 0.015  # 浮盈1.5%后启动追踪止损
 TRAIL_DISTANCE = 0.008  # 追踪止损距离0.8%
 TIME_STOP_SEC = 600     # 10分钟时间止损（妖币行情需要更多时间）
@@ -280,6 +280,10 @@ def is_near_settlement():
     for h in SETTLEMENT_HOURS_UTC:
         settlement = now_utc.replace(hour=h, minute=0, second=0, microsecond=0)
         diff = (settlement - now_utc).total_seconds()
+        # 修复跨天问题：如果结算时间已过（diff<=0），计算明天的
+        if diff <= 0:
+            settlement += timedelta(days=1)
+            diff = (settlement - now_utc).total_seconds()
         if 0 < diff <= PRE_SETTLEMENT_BUFFER_MIN * 60:
             return True, int(diff)
     return False, 0
@@ -532,13 +536,11 @@ def open_position(inst_id, direction, balance_for_trade):
     if direction == "LONG":
         tp = format_price(price * (1 + TP_PCT))
         sl = format_price(price * (1 - SL_PCT))
-        crash = format_price(price * (1 - CRASH_SL_PCT))
         side = "buy"
         close_side = "sell"
     else:
         tp = format_price(price * (1 - TP_PCT))
         sl = format_price(price * (1 + SL_PCT))
-        crash = format_price(price * (1 + CRASH_SL_PCT))
         side = "sell"
         close_side = "buy"
     
@@ -575,7 +577,8 @@ def open_position(inst_id, direction, balance_for_trade):
     avg = pos["avgPx"]
     sz = int(abs(pos["pos"]))
     
-    # 挂TP+SL+CRASH
+    # 挂TP+SL（移除冗余CRASH SL — CRASH=2.5%永远被SL=1.5%抢先，白白浪费API请求）
+    # SL已包含暴跌保护，2.5%永远不会在1.5%之前触发
     algo_ids = []
     placed_labels = set()
     lock = threading.Lock()
@@ -597,14 +600,13 @@ def open_position(inst_id, direction, balance_for_trade):
         else:
             log(f"  ❌ {label} @ ${px} 失败: {r.get('msg','')}")
     
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    with ThreadPoolExecutor(max_workers=2) as ex:
         ex.submit(place_algo, "TP", tp, "tpTriggerPx")
         ex.submit(place_algo, "SL", sl, "slTriggerPx")
-        ex.submit(place_algo, "CRASH", crash, "slTriggerPx")
     time.sleep(0.3)
     
     tp_ok = "TP" in placed_labels
-    sl_ok = "SL" in placed_labels or "CRASH" in placed_labels
+    sl_ok = "SL" in placed_labels
     if not tp_ok or not sl_ok:
         log(f"⚠️ {inst_id} TP={tp_ok} SL={sl_ok} (已挂: {placed_labels}) → 强制平仓")
         for close_attempt in range(3):
@@ -898,7 +900,9 @@ def main():
                             continue
                         
                         n_open = min(len(cooled), slots)
-                        per_slot = balance / max(n_open + active_count, 1)
+                        # 修正：只除以新开仓数（已有仓位的保证金已被占用，availBal已扣除）
+                        # 留5%缓冲防手续费/精度导致的余额不足
+                        per_slot = balance * 0.95 / max(n_open, 1)
                         if per_slot >= 1:
                             for cand in cooled[:n_open]:
                                 log(f"🔥 妖币开仓: {cand['sym']} {cand['dir']} FR={cand['fr']*100:+.4f}% vol={cand['vol_ratio']:.1f}x")
