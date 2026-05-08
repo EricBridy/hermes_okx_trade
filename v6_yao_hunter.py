@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==================== 配置 ====================
-LEVERAGE = 5
+LEVERAGE = 6
 TP_PCT = 0.03          # 3% 止盈
 SL_PCT = 0.015         # 1.5% 止损
 TRAIL_ACTIVATE = 0.015  # 浮盈1.5%后启动追踪止损
@@ -65,7 +65,8 @@ CHAIN_CACHE = {
     "smart_money_buy": set(),
     "hot_topics": set(),
     "smart_money_inflow": set(),
-    "last_update": 0
+    "last_update": 0,
+    "consecutive_failures": 0
 }
 
 # ==================== 多仓管理 ====================
@@ -76,6 +77,7 @@ positions_lock = threading.Lock()
 SCRIPT_DIR = os.path.expanduser("~/.hermes/scripts")
 STATE_FILE = os.path.join(SCRIPT_DIR, "v6_state.json")
 LOG_FILE = os.path.join(SCRIPT_DIR, "v6_trades.log")
+CHAIN_CACHE_FILE = os.path.join(SCRIPT_DIR, "v6_chain_cache.json")
 
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -249,19 +251,71 @@ def fetch_smart_money_inflow():
             pass
     return result
 
+def save_chain_cache():
+    """持久化链上缓存到磁盘"""
+    try:
+        data = {
+            "smart_money_buy": list(CHAIN_CACHE["smart_money_buy"]),
+            "hot_topics": list(CHAIN_CACHE["hot_topics"]),
+            "smart_money_inflow": list(CHAIN_CACHE["smart_money_inflow"]),
+            "last_update": CHAIN_CACHE["last_update"]
+        }
+        with open(CHAIN_CACHE_FILE, "w") as f:
+            json.dump(data, f)
+    except:
+        pass
+
+def load_chain_cache():
+    """从磁盘恢复链上缓存（进程重启后使用）"""
+    try:
+        if os.path.exists(CHAIN_CACHE_FILE):
+            with open(CHAIN_CACHE_FILE) as f:
+                data = json.load(f)
+            CHAIN_CACHE["smart_money_buy"] = set(data.get("smart_money_buy", []))
+            CHAIN_CACHE["hot_topics"] = set(data.get("hot_topics", []))
+            CHAIN_CACHE["smart_money_inflow"] = set(data.get("smart_money_inflow", []))
+            age = time.time() - data.get("last_update", 0)
+            log(f"  [chain] 从磁盘恢复缓存: SM={len(CHAIN_CACHE['smart_money_buy'])} HOT={len(CHAIN_CACHE['hot_topics'])} INF={len(CHAIN_CACHE['smart_money_inflow'])} (缓存{int(age)}秒前)")
+            CHAIN_CACHE["last_update"] = data.get("last_update", 0)
+            return True
+    except:
+        pass
+    return False
+
 def update_chain_cache():
     now = time.time()
-    if now - CHAIN_CACHE["last_update"] < CHAIN_DATA_TTL:
+    # 连续失败时延长TTL（避免反复请求timeout的API）
+    effective_ttl = CHAIN_DATA_TTL
+    if CHAIN_CACHE["consecutive_failures"] >= 3:
+        effective_ttl = CHAIN_DATA_TTL * 4  # 连续失败3次后TTL延长到8分钟
+    if now - CHAIN_CACHE["last_update"] < effective_ttl:
         return
     with ThreadPoolExecutor(max_workers=3) as ex:
         f_sm = ex.submit(fetch_smart_money_signals)
         f_ht = ex.submit(fetch_hot_topic_tokens)
         f_in = ex.submit(fetch_smart_money_inflow)
-        CHAIN_CACHE["smart_money_buy"] = f_sm.result()
-        CHAIN_CACHE["hot_topics"] = f_ht.result()
-        CHAIN_CACHE["smart_money_inflow"] = f_in.result()
-    CHAIN_CACHE["last_update"] = now
-    log(f"  [chain] SM_buy={len(CHAIN_CACHE['smart_money_buy'])} topics={len(CHAIN_CACHE['hot_topics'])} SM_inflow={len(CHAIN_CACHE['smart_money_inflow'])}")
+        try:
+            sm = f_sm.result(timeout=CHAIN_API_TIMEOUT + 2)
+            ht = f_ht.result(timeout=CHAIN_API_TIMEOUT + 2)
+            inf = f_in.result(timeout=CHAIN_API_TIMEOUT + 2)
+            # 3个API中至少1个返回数据才算成功
+            if sm or ht or inf:
+                CHAIN_CACHE["smart_money_buy"] = sm
+                CHAIN_CACHE["hot_topics"] = ht
+                CHAIN_CACHE["smart_money_inflow"] = inf
+                CHAIN_CACHE["last_update"] = now
+                CHAIN_CACHE["consecutive_failures"] = 0
+                save_chain_cache()  # 成功时持久化
+                log(f"  [chain] SM_buy={len(sm)} topics={len(ht)} SM_inflow={len(inf)}")
+            else:
+                CHAIN_CACHE["consecutive_failures"] += 1
+                log(f"  [chain] 3个API均无数据 (连续失败{CHAIN_CACHE['consecutive_failures']}次，使用缓存)")
+        except Exception as e:
+            CHAIN_CACHE["consecutive_failures"] += 1
+            log(f"  [chain] API异常: {e} (连续失败{CHAIN_CACHE['consecutive_failures']}次，使用缓存)")
+            # API失败且无缓存时，设置last_update防止反复请求
+            if CHAIN_CACHE["last_update"] == 0:
+                CHAIN_CACHE["last_update"] = now
 
 def get_chain_score(ticker_symbol):
     score = 0
@@ -593,6 +647,21 @@ def close_position(inst_id, algo_ids=None):
     }))
     return r
 
+def get_realized_pnl(inst_id):
+    """查询OKX账单API获取最近一笔已实现盈亏（精确值）"""
+    try:
+        d = okx_get(f"/api/v5/account/bills?instId={inst_id}&instType=SWAP&limit=5")
+        if d.get("data"):
+            for bill in d["data"]:
+                pnl = float(bill.get("realizedPnl", 0))
+                fee = float(bill.get("fee", 0))
+                # realizedPnl已经扣了手续费，所以直接用
+                if pnl != 0:
+                    return pnl, fee
+        return 0, 0
+    except:
+        return 0, 0
+
 def open_position(inst_id, direction, balance_for_trade, channel_label=""):
     """开仓 + 挂TP/SL"""
     specs = INSTRUMENTS_CACHE.get(inst_id)
@@ -786,6 +855,7 @@ def main():
     log("=" * 60)
 
     load_instruments_cache()
+    load_chain_cache()  # 启动时从磁盘恢复链上缓存
     state = load_state()
     scan_count = 0
 
@@ -871,22 +941,22 @@ def main():
                         saved_upl = positions.get(inst_id, {}).get("last_upl", 0) if inst_id in positions else 0
 
                         if result == "CLOSED":
-                            pos_upl = positions[inst_id].get("last_upl", None) if inst_id in positions else None
-                            if pos_upl is not None and pos_upl > 0:
+                            # 用OKX账单API查精确盈亏（不依赖last_upl估算）
+                            time.sleep(0.5)  # 等待OKX记录账单
+                            actual_pnl, actual_fee = get_realized_pnl(inst_id)
+                            pos_upl = actual_pnl if actual_pnl != 0 else (
+                                positions[inst_id].get("last_upl", 0) if inst_id in positions else 0)
+                            log(f"  📊 {inst_id} CLOSED upl=${pos_upl:.4f} fee=${actual_fee:.4f}")
+                            if pos_upl > 0:
                                 state["consecutive_losses"] = 0
-                                state["total_pnl"] = state.get("total_pnl", 0) + pos_upl
-                                state["trade_count"] = state.get("trade_count", 0) + 1
-                                log(f"  📊 {inst_id} CLOSED(盈利) upl=${pos_upl:.4f}")
                             else:
                                 state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
-                                pnl_val = pos_upl if pos_upl else 0
-                                state["total_pnl"] = state.get("total_pnl", 0) + pnl_val
-                                state["trade_count"] = state.get("trade_count", 0) + 1
                                 if state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
                                     pause_until = datetime.now() + timedelta(seconds=LOSS_PAUSE_SEC)
                                     state["pause_until"] = pause_until.isoformat()
                                     log(f"⏸️ {state['consecutive_losses']}连亏，暂停{LOSS_PAUSE_SEC//60}分钟")
-                                log(f"  📊 {inst_id} CLOSED(亏损) upl=${pnl_val:.4f}")
+                            state["total_pnl"] = state.get("total_pnl", 0) + pos_upl
+                            state["trade_count"] = state.get("trade_count", 0) + 1
 
                         with positions_lock:
                             if inst_id in positions:
