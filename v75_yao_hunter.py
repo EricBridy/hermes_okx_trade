@@ -213,6 +213,15 @@ def load_state():
     return {"consecutive_losses": 0, "pause_until": None, "last_trade": {}, "total_pnl": 0, "trade_count": 0}
 
 def save_state(state):
+    # 持久化仓位元数据（channel/source_channel/score），用于重启恢复
+    pos_meta = {}
+    for pid, pinfo in positions.items():
+        pos_meta[pid] = {
+            "channel": pinfo.get("channel", ""),
+            "source_channel": pinfo.get("source_channel", ""),
+            "score": pinfo.get("score", 0),
+        }
+    state["position_meta"] = pos_meta
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
@@ -1246,6 +1255,8 @@ def main():
 
     # 重启前先查FR数据，用于判断恢复持仓的通道来源
     # 这样可以正确分配channel而不是用"?"
+    # 重启前查询已保存的仓位通道信息
+    _saved_pos_meta = state.get("position_meta", {})
     _restore_fr_map = {}
     _restore_existing = get_all_positions()
     if _restore_existing:
@@ -1264,21 +1275,27 @@ def main():
             specs = INSTRUMENTS_CACHE.get(inst_id, {})
             notional = abs(pos_val) * specs.get("ctVal", 1) * entry_price
             matched_algos = algo_map.get(inst_id, [])
-            # 通过FR判断恢复持仓的通道来源
-            restored_fr = _restore_fr_map.get(inst_id)
+            # 通过保存的元数据>FR判断恢复持仓的通道来源
             restored_channel = "?"
-            if restored_fr is not None:
-                if abs(restored_fr) >= FR_EXTREME_THRESHOLD and restored_fr < 0:
-                    restored_channel = "A"  # FR极端负 → 通道A
-                else:
-                    restored_channel = "B"  # 其他 → 通道B
+            saved_meta = _saved_pos_meta.get(inst_id, {})
+            if saved_meta.get("channel"):
+                restored_channel = saved_meta["channel"]
+            else:
+                restored_fr = _restore_fr_map.get(inst_id)
+                if restored_fr is not None:
+                    if abs(restored_fr) >= FR_EXTREME_THRESHOLD and restored_fr < 0:
+                        restored_channel = "A"
+                    else:
+                        restored_channel = "B"
             positions[inst_id] = {
                 "instId": inst_id, "direction": direction,
                 "entry_price": entry_price, "sz": int(abs(pos_val)),
                 "algo_ids": matched_algos, "open_time": time.time(),
                 "notional": notional, "trail_activated": False,
-                "highest_pnl_pct": 0, "fr": restored_fr or 0,
-                "last_upl": float(p.get("upl", 0)), "channel": restored_channel
+                "highest_pnl_pct": 0, "fr": _restore_fr_map.get(inst_id) or 0,
+                "last_upl": float(p.get("upl", 0)), "channel": restored_channel,
+                "score": saved_meta.get("score", 0),
+                "source_channel": saved_meta.get("source_channel", ""),
             }
             algo_status = f" algo={len(matched_algos)}" if matched_algos else " ⚠️无挂单"
             log(f"  📥 {inst_id} {direction} {int(abs(pos_val))}张 @ ${entry_price}{algo_status}")
@@ -1300,7 +1317,7 @@ def main():
                 with positions_lock:
                     if extra_pid in positions:
                         del positions[extra_pid]
-    else:
+    if not positions:
         log("  无持仓")
 
     # 清理残留algo单
