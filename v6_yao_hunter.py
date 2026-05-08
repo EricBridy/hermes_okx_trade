@@ -385,9 +385,9 @@ def get_multi_timeframe(sym):
     """获取1m/5m/15m K线，计算动量指标"""
     try:
         # 1分钟K线
-        c1m = curl_json(f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar=1m&limit=20", 5)
+        c1m = curl_json(f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar=1m&limit=30", 5)
         # 5分钟K线
-        c5m = curl_json(f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar=5m&limit=6", 5)
+        c5m = curl_json(f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar=5m&limit=10", 5)
         # 15分钟K线（新增）
         c15m = curl_json(f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar=15m&limit=6", 5)
 
@@ -410,6 +410,26 @@ def get_multi_timeframe(sym):
             result['ups'] = ups
             result['downs'] = downs
 
+            # === RSI(14) ===
+            if len(closes) >= 15:
+                deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+                gains = [d if d > 0 else 0 for d in deltas[:14]]
+                losses = [-d if d < 0 else 0 for d in deltas[:14]]
+                avg_gain = sum(gains) / 14
+                avg_loss = sum(losses) / 14
+                if avg_loss > 0:
+                    rs = avg_gain / avg_loss
+                    result['rsi_14'] = 100 - (100 / (1 + rs))
+                else:
+                    result['rsi_14'] = 100  # 全涨
+
+            # === 1m反转检测：最近3根1m的涨跌方向 ===
+            if len(candles) >= 3:
+                last3_up = sum(1 for i in range(-3, 0) if closes[i] > closes[i-1])
+                last3_down = 3 - last3_up
+                result['last3_1m_ups'] = last3_up
+                result['last3_1m_downs'] = last3_down
+
         if c5m.get("data") and len(c5m["data"]) >= 4:
             c5 = c5m["data"][::-1]
             cl5 = [float(c[4]) for c in c5]
@@ -418,6 +438,20 @@ def get_multi_timeframe(sym):
             r5 = sum(vl5[-2:]) / 2
             h5 = sum(vl5[:-2]) / max(len(vl5[:-2]), 1)
             result['vol_5m'] = r5 / max(h5, 0.001)
+
+            # === 5m连续确认：最近2根5m是否同向 ===
+            if len(cl5) >= 2:
+                last_5m_chg = (cl5[-1] - cl5[-2]) / cl5[-2] * 100
+                prev_5m_chg = (cl5[-2] - cl5[-3]) / cl5[-3] * 100 if len(cl5) >= 3 else 0
+                result['last_5m_chg'] = last_5m_chg
+                result['prev_5m_chg'] = prev_5m_chg
+                # 两根同向且同向幅度 > 0.2%
+                if last_5m_chg > 0.2 and prev_5m_chg > 0.2:
+                    result['5m_consecutive'] = 'UP'
+                elif last_5m_chg < -0.2 and prev_5m_chg < -0.2:
+                    result['5m_consecutive'] = 'DOWN'
+                else:
+                    result['5m_consecutive'] = 'NONE'
 
         # 15分钟趋势（新增）
         if c15m.get("data") and len(c15m["data"]) >= 4:
@@ -442,17 +476,41 @@ def get_multi_timeframe(sym):
     except:
         return {}
 
-def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_15m=None, chg_5m_dir=None):
-    """通道B综合评分（满分14）"""
+def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_15m=None, chg_5m_dir=None, mt_data=None):
+    """通道B综合评分（满分16）"""
     score = 0
 
     # 0. 15m趋势一致性检查（一票否决）
-    # 如果5m方向和15m趋势相反，直接返回0分
     if trend_15m and chg_5m_dir:
         if chg_5m_dir == "LONG" and trend_15m == "DOWN":
-            return 0  # 5m涨但15m跌 → 不做
+            return 0
         if chg_5m_dir == "SHORT" and trend_15m == "UP":
-            return 0  # 5m跌但15m涨 → 不做
+            return 0
+
+    # 0b. RSI极端区域（一票否决）
+    rsi = mt_data.get("rsi_14", 50) if mt_data else 50
+    if chg_5m_dir == "LONG" and rsi > 70:
+        return 0  # 超买区做多 = 等着被瀑布
+    if chg_5m_dir == "SHORT" and rsi < 30:
+        return 0  # 超卖区做空 = 等着被拉爆
+
+    # 0c. 1m反转检测（一票否决）
+    if mt_data:
+        last3_up = mt_data.get("last3_1m_ups", 1)
+        last3_down = mt_data.get("last3_1m_downs", 1)
+        if chg_5m_dir == "LONG" and last3_down >= 3:
+            return 0  # 做多但最近3根1m全阴 = 正在反转
+        if chg_5m_dir == "SHORT" and last3_up >= 3:
+            return 0  # 做空但最近3根1m全阳 = 正在反转
+
+    # 0d. 5m连续确认
+    consecutive_bonus = 0
+    if mt_data:
+        consec = mt_data.get("5m_consecutive", "NONE")
+        if chg_5m_dir == "LONG" and consec == "UP":
+            consecutive_bonus = 1
+        elif chg_5m_dir == "SHORT" and consec == "DOWN":
+            consecutive_bonus = 1
 
     # 1. 5m涨跌幅度 (1-3分)
     abs_chg = abs(chg_5m)
@@ -485,12 +543,15 @@ def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_
         if (fr < 0 and chg_5m > 0) or (fr > 0 and chg_5m < 0):
             score += 1
 
-    # 6. 15m趋势强度加分 (+1分)
+    # 6. 15m趋势强度 (+1分)
     if trend_15m and chg_5m_dir:
         if chg_5m_dir == "LONG" and trend_15m == "UP":
             score += 1
         elif chg_5m_dir == "SHORT" and trend_15m == "DOWN":
             score += 1
+
+    # 7. 5m连续确认 (+1分)
+    score += consecutive_bonus
 
     return score
 
@@ -595,8 +656,8 @@ def scan_dual_channel():
             else:
                 continue
 
-            # 评分（传入15m趋势做一致性检查）
-            mom_score = calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_15m, direction)
+            # 评分（传入15m趋势+完整mt_data做多维度过滤）
+            mom_score = calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_15m, direction, mt)
 
             if mom_score >= MOMENTUM_SCORE_THRESHOLD:
                 channel_b_candidates.append({
@@ -610,6 +671,7 @@ def scan_dual_channel():
                     "channel": "B",
                     "chain_tags": chain_tags,
                     "position_pct": CHANNEL_B_POSITION_PCT,
+                    "trend_15m": trend_15m,
                 })
 
     # 排序
@@ -810,6 +872,7 @@ def open_position(inst_id, direction, balance_for_trade, channel_label=""):
         "notional": notional_actual, "trail_activated": False,
         "highest_pnl_pct": 0, "fr": 0,
         "last_upl": 0, "channel": channel_label,
+        "score": 0,  # 开仓后由调用方设置
     }
 
 # ==================== 持仓监控 ====================
@@ -1032,7 +1095,13 @@ def main():
 
             # ===== 双通道扫描 =====
             active_count = len(positions)
-            if active_count < MAX_CONCURRENT:
+            need_scan = active_count < MAX_CONCURRENT
+
+            # 即使仓位满了，也扫描看有没有高分候选（用于淘汰低分持仓）
+            if not need_scan:
+                need_scan = True  # 永远扫描，后面判断是否替换
+
+            if need_scan:
                 scan_count += 1
                 balance = get_balance()
                 log(f"📡 扫描#{scan_count} 余额:${balance:.2f} 仓位:{active_count}/{MAX_CONCURRENT}")
@@ -1044,14 +1113,14 @@ def main():
                     log(f"  🔴 通道A(FR反向): {len(channel_a)}个候选")
                     for c in channel_a[:3]:
                         tags = f"[{','.join(c['chain_tags'])}]" if c.get("chain_tags") else ""
-                        log(f"    {c['sym']} ↑多 FR={c['fr']*100:+.4f}% vol=${c['vol24h']/1e6:.0f}M {tags}")
+                        log(f"    {c['sym']} ↑多 FR={c['fr']*100:+.4f}% score={c['score']} vol=${c['vol24h']/1e6:.0f}M {tags}")
 
                 # 打印通道B候选
                 if channel_b:
                     log(f"  🔵 通道B(动量): {len(channel_b)}个候选")
                     for c in channel_b[:3]:
                         tags = f"[{','.join(c['chain_tags'])}]" if c.get("chain_tags") else ""
-                        log(f"    {c['sym']} {'↑' if c['dir']=='LONG' else '↓'} 5m:{c.get('chg_5m',0):+.2f}% score:{c['score']} {tags}")
+                        log(f"    {c['sym']} {'↑' if c['dir']=='LONG' else '↓'} 5m:{c.get('chg_5m',0):+.2f}% 15m:{c.get('trend_15m','?')} score:{c['score']} {tags}")
 
                 if not channel_a and not channel_b:
                     log(f"  ⏳ 双通道均无信号，等待...")
@@ -1061,12 +1130,10 @@ def main():
                 # 合并候选，优先通道A，去重
                 all_candidates = []
                 seen_syms = set()
-                # 通道A优先
                 for c in channel_a:
                     if c["sym"] not in seen_syms:
                         all_candidates.append(c)
                         seen_syms.add(c["sym"])
-                # 通道B补充
                 for c in channel_b:
                     if c["sym"] not in seen_syms:
                         all_candidates.append(c)
@@ -1098,16 +1165,36 @@ def main():
                     time.sleep(60)
                     continue
 
-                # 开仓（动态分配余额，确保每个仓位都有足够资金）
-                slots = MAX_CONCURRENT - active_count
-                n_open = min(len(cooled), slots)
+                # ===== 动态仓位管理：有空位就开，没空位看能否替换 =====
+                active_count = len(positions)
+                slots_available = MAX_CONCURRENT - active_count
+
+                if slots_available <= 0 and cooled:
+                    # 仓位满了，看最高分候选是否能替换最低分持仓
+                    best_cand = cooled[0]  # 已按score排序
+                    # 找持仓中评分最低的
+                    if positions:
+                        lowest_pos_id = min(positions.keys(), key=lambda k: positions[k].get("score", 0))
+                        lowest_score = positions[lowest_pos_id].get("score", 0)
+                        if best_cand["score"] > lowest_score:
+                            log(f"  🔄 淘汰低分: {lowest_pos_id}(score={lowest_score}) → 开高分: {best_cand['sym']}(score={best_cand['score']})")
+                            close_position(lowest_pos_id, positions[lowest_pos_id].get("algo_ids"))
+                            time.sleep(1)
+                            if lowest_pos_id in positions:
+                                with positions_lock:
+                                    del positions[lowest_pos_id]
+                            state["last_trade"][lowest_pos_id] = time.time()
+                            slots_available += 1
+                        else:
+                            log(f"  ⏳ 最高候选score={best_cand['score']} ≤ 最低持仓score={lowest_score}，不替换")
+                            time.sleep(SCAN_INTERVAL)
+                            continue
+
+                # 开仓
+                n_open = min(len(cooled), slots_available)
                 if balance >= 1 and n_open > 0:
-                    # 动态分配：当需要同时开多个仓时，按权重分配余额
-                    # 避免第一个仓占90%后第二个仓没钱开
                     candidates_to_open = cooled[:n_open]
                     if len(candidates_to_open) >= 2:
-                        # 多仓模式：总仓位不超过余额的95%，按优先级分配
-                        # A通道权重1.5，B通道权重1.0
                         weights = []
                         for c in candidates_to_open:
                             w = 1.5 if c["channel"] == "A" else 1.0
@@ -1119,7 +1206,6 @@ def main():
                             f"[{c['channel']}]{c['sym']}={c['position_pct']*100:.0f}%" for c in candidates_to_open))
 
                     for cand in candidates_to_open:
-                        # 开仓前重新查余额（上一仓可能已扣保证金）
                         balance = get_balance()
                         if balance < 1:
                             log(f"  ⏳ 余额不足(${balance:.2f})，停止开仓")
@@ -1129,6 +1215,7 @@ def main():
                         pos = open_position(cand["sym"], cand["dir"], per_slot, cand["channel"])
                         if pos:
                             pos["fr"] = cand.get("fr", 0)
+                            pos["score"] = cand.get("score", 0)
                             with positions_lock:
                                 positions[cand["sym"]] = pos
                             save_state(state)
