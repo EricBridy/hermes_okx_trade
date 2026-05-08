@@ -69,7 +69,7 @@ OKX 永续合约自动化交易系统
 
 ```python
 # 基础
-LEVERAGE = 5
+LEVERAGE = 6
 TP_PCT = 0.03          # 止盈 3%
 SL_PCT = 0.015         # 止损 1.5%
 TRAIL_ACTIVATE = 0.015  # 追踪止损激活 1.5%
@@ -163,7 +163,7 @@ tail -f ~/.hermes/scripts/v6_trades.log
 | #2 | get_balance无异常保护，details空数组IndexError | 添加try/except和长度检查 |
 | #3 | total_pnl只计数(+1)不算金额 | 改为记录实际upl金额，新增trade_count |
 | #4 | TIME_STOP统一算亏损，微盈也算连亏 | 区分saved_upl>0则重置连亏 |
-| #5 | 杠杆配置LEVERAGE=5与文档一致 | 确认5x，保持不变 |
+| #5 | 杠杆配置LEVERAGE=5 | 改为6x（收益+20%，爆仓线16.7%） |
 | #6 | K线API 15并发×2=30请求，超OKX限流 | 降低到10并发，扫描范围40→30 |
 | #7 | 链上API 8秒timeout白等，chain_bonus永远=0 | timeout降到3秒，刷新间隔60→120秒 |
 | #8 | 通道A定义了放量阈值但扫描未检查 | 添加vol_1m>=1.3x过滤条件 |
@@ -173,6 +173,8 @@ tail -f ~/.hermes/scripts/v6_trades.log
 | #12 | load_state默认值缺少trade_count | 添加trade_count: 0 |
 | #13 | okx_post/okx_get中import requests无保护 | 添加try/except ImportError |
 | #14 | 小资金下通道A占90%后通道B永远开不了 | 多仓时按权重动态分配余额（A:1.5, B:1.0） |
+| #15 | 链上API全部timeout时chain_bonus永远=0 | 持久化缓存到磁盘，连续失败延长TTL，启动时恢复 |
+| #16 | CLOSED分支用last_upl估算盈亏不精确 | 用OKX账单API查询精确realizedPnl |
 
 **v5.1→v6.0 改动依据（全部来自OKX API账单复盘）：**
 
