@@ -10,7 +10,7 @@ OKX 妖币猎手 v6.0 — 双通道策略
 - 通道B: 不依赖FR，靠短期动量+放量捕捉行情
 """
 
-import subprocess, json, time, os, hmac, base64, sys, threading
+import subprocess, json, time, os, hmac, base64, threading
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -47,9 +47,10 @@ OKX_TAKER_FEE = 0.0005          # 0.05% taker
 ROUND_TRIP_FEE = OKX_TAKER_FEE * 2  # 0.1%
 
 # 链上数据
-CHAIN_DATA_TTL = 60
+CHAIN_DATA_TTL = 120       # 2分钟刷新一次（降频减少timeout影响）
 CHAIN_BONUS = 2
 CHAIN_API_BASE = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct"
+CHAIN_API_TIMEOUT = 3      # 3秒超时（原8秒太长）
 
 # 时间窗口 (UTC+8) — 24小时
 TRADING_WINDOWS = [(0, 0, 23, 59)]
@@ -94,7 +95,7 @@ def load_state():
                 return json.load(f)
     except:
         pass
-    return {"consecutive_losses": 0, "pause_until": None, "last_trade": {}, "total_pnl": 0}
+    return {"consecutive_losses": 0, "pause_until": None, "last_trade": {}, "total_pnl": 0, "trade_count": 0}
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
@@ -114,7 +115,11 @@ def get_creds():
     return api_key, secret_key, passphrase
 
 def okx_post(path, body_str):
-    import requests
+    try:
+        import requests
+    except ImportError:
+        log("❌ requests未安装")
+        return {"code": "-1", "msg": "requests not installed"}
     api_key, secret_key, passphrase = get_creds()
     for attempt in range(3):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -137,7 +142,11 @@ def okx_post(path, body_str):
     return {"code": "-1", "msg": "max retries"}
 
 def okx_get(path):
-    import requests
+    try:
+        import requests
+    except ImportError:
+        log("❌ requests未安装")
+        return {"code": "-1", "msg": "requests not installed"}
     api_key, secret_key, passphrase = get_creds()
     for attempt in range(3):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -197,7 +206,7 @@ def fetch_smart_money_signals():
             d = curl_json_post(
                 CHAIN_API_BASE + "/buw/wallet/web/signal/smart-money/ai",
                 {"chainId": chain_id, "page": 1, "pageSize": 50},
-                timeout=8
+                timeout=CHAIN_API_TIMEOUT
             )
             if d.get("data"):
                 for sig in d["data"]:
@@ -214,7 +223,7 @@ def fetch_hot_topic_tokens():
     for chain_id in ["CT_501", "56"]:
         try:
             url = "https://web3.binance.com/bapi/defi/v2/public/wallet-direct/buw/wallet/market/token/social-rush/rank/list/ai"
-            d = curl_json(f"{url}?chainId={chain_id}&rankType=20&sort=20&asc=false", timeout=8)
+            d = curl_json(f"{url}?chainId={chain_id}&rankType=20&sort=20&asc=false", timeout=CHAIN_API_TIMEOUT)
             if d.get("data"):
                 for topic in d.get("data", []):
                     for t in topic.get("tokenList", [])[:5]:
@@ -230,7 +239,7 @@ def fetch_smart_money_inflow():
     for chain_id in ["CT_501", "56"]:
         try:
             url = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct/tracker/wallet/token/inflow/rank/query/ai"
-            d = curl_json_post(url, {"chainId": chain_id, "period": "4h", "tagType": 2}, timeout=8)
+            d = curl_json_post(url, {"chainId": chain_id, "period": "4h", "tagType": 2}, timeout=CHAIN_API_TIMEOUT)
             if d.get("data"):
                 for item in d.get("data", [])[:20]:
                     sym = (item.get("tokenName") or "").upper()
@@ -325,7 +334,7 @@ def get_funding_rates_batch(syms):
         except:
             pass
         return sym, None
-    with ThreadPoolExecutor(max_workers=15) as ex:
+    with ThreadPoolExecutor(max_workers=10) as ex:
         for sym, rate in ex.map(get_fr, syms):
             if rate is not None:
                 results[sym] = rate
@@ -438,10 +447,10 @@ def scan_dual_channel():
     # 2. 并行获取资金费率
     fr_map = get_funding_rates_batch(syms)
 
-    # 3. 并行获取K线数据（只对前40个，节省API配额）
+    # 3. 并行获取K线数据（只对前30个，并发10避免限流50011）
     mt_data = {}
-    with ThreadPoolExecutor(max_workers=15) as ex:
-        futures = {ex.submit(get_multi_timeframe, s): s for s in syms[:40]}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(get_multi_timeframe, s): s for s in syms[:30]}
         for f in as_completed(futures):
             sym = futures[f]
             try:
@@ -470,26 +479,29 @@ def scan_dual_channel():
             if FR_EXTREME_THRESHOLD <= abs_fr <= FR_MAX_THRESHOLD:
                 # 复盘验证: 只做FR<0做多
                 if fr < 0:
-                    # 跟踪FR持久性
-                    now = time.time()
-                    prev = FR_HISTORY.get(sym)
-                    persistence_bonus = 0
-                    if prev and (now - prev["ts"]) < FR_HISTORY_TTL:
-                        if prev["fr"] < 0 and fr < 0:
-                            persistence_bonus = 1
-                    FR_HISTORY[sym] = {"fr": fr, "ts": now}
+                    # 必须有放量信号（避免低流动性滑点）
+                    vol_1m_a = mt.get("vol_1m", 0)
+                    if vol_1m_a >= CHANNEL_A_VOL_SPIKE:
+                        # 跟踪FR持久性
+                        now = time.time()
+                        prev = FR_HISTORY.get(sym)
+                        persistence_bonus = 0
+                        if prev and (now - prev["ts"]) < FR_HISTORY_TTL:
+                            if prev["fr"] < 0 and fr < 0:
+                                persistence_bonus = 1
+                        FR_HISTORY[sym] = {"fr": fr, "ts": now}
 
-                    channel_a_candidates.append({
-                        "sym": sym,
-                        "dir": "LONG",
-                        "fr": fr,
-                        "abs_fr": abs_fr,
-                        "vol24h": item["vol24h"],
-                        "score": abs_fr * 10000 + persistence_bonus + chain_bonus,
-                        "channel": "A",
-                        "chain_tags": chain_tags,
-                        "position_pct": CHANNEL_A_POSITION_PCT,
-                    })
+                        channel_a_candidates.append({
+                            "sym": sym,
+                            "dir": "LONG",
+                            "fr": fr,
+                            "abs_fr": abs_fr,
+                            "vol24h": item["vol24h"],
+                            "score": abs_fr * 10000 + persistence_bonus + chain_bonus,
+                            "channel": "A",
+                            "chain_tags": chain_tags,
+                            "position_pct": CHANNEL_A_POSITION_PCT,
+                        })
 
         # ===== 通道B: 动量顺势 =====
         if mt and "chg_5m" in mt:
@@ -531,10 +543,13 @@ def scan_dual_channel():
 
 # ==================== 交易操作 ====================
 def get_balance():
-    d = okx_get("/api/v5/account/balance?ccy=USDT")
-    if d.get("data"):
-        det = d["data"][0]["details"][0]
-        return float(det.get("availBal") or det.get("eq") or 0)
+    try:
+        d = okx_get("/api/v5/account/balance?ccy=USDT")
+        if d.get("data") and d["data"][0].get("details") and len(d["data"][0]["details"]) > 0:
+            det = d["data"][0]["details"][0]
+            return float(det.get("availBal") or det.get("eq") or 0)
+    except Exception as e:
+        log(f"⚠️ get_balance异常: {e}")
     return 0
 
 def get_position(inst_id):
@@ -716,7 +731,10 @@ def monitor_position(inst_id, pos_info):
         return "CLOSED"
 
     d = curl_json(f"https://www.okx.com/api/v5/market/ticker?instId={inst_id}", 5)
-    current_price = float(d["data"][0]["last"]) if d.get("data") else pos["avgPx"]
+    if not d.get("data"):
+        log(f"  ⚠️ {inst_id} ticker API失败，本轮跳过监控")
+        return "HOLDING"
+    current_price = float(d["data"][0]["last"])
 
     upl = pos["upl"]
     pos_info["last_upl"] = upl
@@ -741,8 +759,8 @@ def monitor_position(inst_id, pos_info):
         pos_info["trail_activated"] = True
         log(f"🔔 {inst_id} 追踪止损激活! 浮盈{pct_change:+.2f}% > {TRAIL_ACTIVATE*100}%")
 
-    # 紧急止盈
-    emergency_tp = TP_PCT * 200  # 6%
+    # 紧急止盈（6%）
+    emergency_tp = 6.0
     if pct_change >= emergency_tp:
         log(f"🚀 {inst_id} 紧急止盈{pct_change:+.3f}% >= {emergency_tp}% → 立即落袋")
         close_position(inst_id, pos_info.get("algo_ids"))
@@ -849,19 +867,26 @@ def main():
                         continue
 
                     if result in ("PROFIT", "TRAIL_STOP", "TIME_STOP", "CLOSED"):
+                        # 先保存upl（后续del会清除）
+                        saved_upl = positions.get(inst_id, {}).get("last_upl", 0) if inst_id in positions else 0
+
                         if result == "CLOSED":
-                            pos_upl = positions[inst_id].get("last_upl", None)
+                            pos_upl = positions[inst_id].get("last_upl", None) if inst_id in positions else None
                             if pos_upl is not None and pos_upl > 0:
                                 state["consecutive_losses"] = 0
-                                state["total_pnl"] = state.get("total_pnl", 0) + 1
+                                state["total_pnl"] = state.get("total_pnl", 0) + pos_upl
+                                state["trade_count"] = state.get("trade_count", 0) + 1
                                 log(f"  📊 {inst_id} CLOSED(盈利) upl=${pos_upl:.4f}")
                             else:
                                 state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+                                pnl_val = pos_upl if pos_upl else 0
+                                state["total_pnl"] = state.get("total_pnl", 0) + pnl_val
+                                state["trade_count"] = state.get("trade_count", 0) + 1
                                 if state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
                                     pause_until = datetime.now() + timedelta(seconds=LOSS_PAUSE_SEC)
                                     state["pause_until"] = pause_until.isoformat()
                                     log(f"⏸️ {state['consecutive_losses']}连亏，暂停{LOSS_PAUSE_SEC//60}分钟")
-                                log(f"  📊 {inst_id} CLOSED(亏损) upl=${pos_upl if pos_upl else 'N/A'}")
+                                log(f"  📊 {inst_id} CLOSED(亏损) upl=${pnl_val:.4f}")
 
                         with positions_lock:
                             if inst_id in positions:
@@ -869,9 +894,15 @@ def main():
 
                         if result in ("PROFIT", "TRAIL_STOP"):
                             state["consecutive_losses"] = 0
-                            state["total_pnl"] = state.get("total_pnl", 0) + 1
+                            state["total_pnl"] = state.get("total_pnl", 0) + saved_upl
+                            state["trade_count"] = state.get("trade_count", 0) + 1
                         elif result == "TIME_STOP":
-                            state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+                            if saved_upl > 0:
+                                state["consecutive_losses"] = 0
+                            else:
+                                state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+                            state["total_pnl"] = state.get("total_pnl", 0) + saved_upl
+                            state["trade_count"] = state.get("trade_count", 0) + 1
                             if state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
                                 pause_until = datetime.now() + timedelta(seconds=LOSS_PAUSE_SEC)
                                 state["pause_until"] = pause_until.isoformat()
@@ -974,11 +1005,16 @@ def main():
                     time.sleep(60)
                     continue
 
-                # 开仓
+                # 开仓（每开一仓后重新查余额，避免余额重复使用）
                 slots = MAX_CONCURRENT - active_count
                 n_open = min(len(cooled), slots)
                 if balance >= 1 and n_open > 0:
                     for cand in cooled[:n_open]:
+                        # 开仓前重新查余额（上一仓可能已扣保证金）
+                        balance = get_balance()
+                        if balance < 1:
+                            log(f"  ⏳ 余额不足(${balance:.2f})，停止开仓")
+                            break
                         per_slot = balance * cand["position_pct"]
                         log(f"🔥 [{cand['channel']}] {cand['sym']} {cand['dir']} FR={cand.get('fr',0)*100:+.4f}% score:{cand['score']} 仓位{cand['position_pct']*100:.0f}%")
                         pos = open_position(cand["sym"], cand["dir"], per_slot, cand["channel"])

@@ -12,7 +12,7 @@ OKX 永续合约自动化交易系统
 - **多要素评分**：动量、放量、趋势一致性、链上信号、FR方向，5维度综合评分
 - **追踪止损**：浮盈1.5%后激活，最高点回撤0.8%自动平仓锁利
 - **紧急止盈**：浮盈达6%立即落袋，防暴涨后回撤
-- **链上数据整合**：Binance Web3 API（聪明钱信号、热门话题、资金流入），60秒刷新
+- **链上数据整合**：Binance Web3 API（聪明钱信号、热门话题、资金流入），120秒刷新
 - **重启安全恢复**：自动加载已有持仓和algo单，清理残留
 - **裸仓保护**：每轮验证所有持仓都有TP/SL挂单，无挂单则强制平仓
 
@@ -81,6 +81,8 @@ CHANNEL_B_POSITION_PCT = 0.60   # 仓位 60%
 # 共用
 MIN_24H_VOL = 2000000           # 最小24h成交量 $200万
 OKX_TAKER_FEE = 0.0005          # 0.05% taker
+CHAIN_DATA_TTL = 120            # 链上数据刷新 120秒
+CHAIN_API_TIMEOUT = 3           # 链上API超时 3秒
 ```
 
 ## 文件说明
@@ -141,6 +143,24 @@ tail -f ~/.hermes/scripts/v6_trades.log
 - 综合评分：动量幅度 + 放量倍数 + 趋势一致性 + 链上信号 + FR方向一致
 - 1m/5m双时间框架K线分析
 - 仓位从1个恢复为2个（两个通道各1个）
+
+**v6.0 Bug修复（05-08 全面审计，13项修复）：**
+
+| Bug | 问题 | 修复 |
+|-----|------|------|
+| #1 | 连续开仓时余额重复使用，第二仓超扣 | 每开一仓前重新查询余额 |
+| #2 | get_balance无异常保护，details空数组IndexError | 添加try/except和长度检查 |
+| #3 | total_pnl只计数(+1)不算金额 | 改为记录实际upl金额，新增trade_count |
+| #4 | TIME_STOP统一算亏损，微盈也算连亏 | 区分saved_upl>0则重置连亏 |
+| #5 | 杠杆配置LEVERAGE=5与文档一致 | 确认5x，保持不变 |
+| #6 | K线API 15并发×2=30请求，超OKX限流 | 降低到10并发，扫描范围40→30 |
+| #7 | 链上API 8秒timeout白等，chain_bonus永远=0 | timeout降到3秒，刷新间隔60→120秒 |
+| #8 | 通道A定义了放量阈值但扫描未检查 | 添加vol_1m>=1.3x过滤条件 |
+| #9 | 监控时ticker API失败用入场价兜底→误触发TIME_STOP | API失败返回HOLDING跳过本轮 |
+| #10 | emergency_tp = TP_PCT*200表达式误导 | 改为直接写6.0 |
+| #11 | import sys未使用 | 删除 |
+| #12 | load_state默认值缺少trade_count | 添加trade_count: 0 |
+| #13 | okx_post/okx_get中import requests无保护 | 添加try/except ImportError |
 
 **v5.1→v6.0 改动依据（全部来自OKX API账单复盘）：**
 
