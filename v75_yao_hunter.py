@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-OKX 妖币猎手 v7.5 — 4仓位独立管理+急速上升检测
-通道A: 极端FR反向 (FR<0→做多，复盘验证唯一稳定盈利)
-通道B: 动量顺势 (5m涨跌+放量+趋势+链上)
+OKX 妖币猎手 v7.6 — 2仓位+多空兼顾+硬性过滤
+通道A: 极端FR+技术指标验证（FR<0做多/FR>0做空，需K线趋势一致）
+通道B: 动量顺势（评分>=8，做空需RSI<65+15m趋势向下）
 
-复盘结论(v5.1 API账单, +$5.32 +46%):
-- JTO FR<0做多赚$7.66，AI/PIPPIN FR>0做空全亏
-- <0.1% FR品种全是噪音
-- 通道B: 不依赖FR，靠短期动量+放量捕捉行情
+v7.6优化（基于v7.5复盘数据）：
+- 砍掉RISING急速上升（9笔净亏$0.55，rank跳变≠趋势）
+- 通道B门槛 score>=5 → score>=8（过滤弱信号）
+- 时间止损 15分钟 → 8分钟（浮盈>0.5%保本追踪）
+- 评分归零不立即换仓，需价格也反向才换
+- 通道A多空兼顾：FR<0做多+FR>0做空，需K线趋势一致
+- 做空硬性过滤：RSI<65且15m趋势向下
 """
 
 import subprocess, json, time, os, hmac, base64, threading
@@ -20,10 +23,10 @@ TP_PCT = 0.03          # 3% 止盈
 SL_PCT = 0.015         # 1.5% 止损
 TRAIL_ACTIVATE = 0.015  # 浮盈1.5%后启动追踪止损
 TRAIL_DISTANCE = 0.008  # 追踪止损距离0.8%
-TIME_STOP_SEC = 900     # 15分钟时间止损
+TIME_STOP_SEC = 480       # 8分钟时间止损
 SCAN_INTERVAL = 30      # 30秒扫描
 COOLDOWN_SEC = 1200     # 同一品种冷却20分钟
-MAX_CONCURRENT = 4      # 4仓位: A独占1个+B独占1个+急速上升2个
+MAX_CONCURRENT = 2      # 2仓位: A独占1个+B独占1个（砍掉RISING急速上升）
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_PAUSE_SEC = 1800   # 连亏暂停30分钟
 SWAP_COOLDOWN = 1800    # 换仓冷却30分钟（防止频繁换仓磨手续费）
@@ -40,7 +43,7 @@ CHANNEL_A_POSITION_PCT = 0.40   # 仓位1占总资金40%
 CHANNEL_A_DIRECTION = "LONG"    # 只做多(FR<0)
 
 # 通道B: 动量顺势
-MOMENTUM_SCORE_THRESHOLD = 5    # 综合评分≥5触发通道B
+MOMENTUM_SCORE_THRESHOLD = 8    # 综合评分>=8触发通道B
 CHANNEL_B_POSITION_PCT = 0.30   # 仓位2占总资金30%
 # 方向: 顺势（涨做多，跌做空）
 
@@ -797,6 +800,16 @@ def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_
 
     return score
 
+def check_short_safety(mt_data):
+    """做空安全检查：RSI<65且15m趋势向下才允许做空"""
+    rsi = mt_data.get("rsi_14", 50)
+    trend = mt_data.get("trend_15m", "FLAT")
+    if rsi > 65:
+        return False, f"RSI={rsi:.0f}>65"
+    if trend == "UP":
+        return False, "15m趋势向上"
+    return True, "ok"
+
 def recalc_position_score(inst_id, pos_info, mt_data_map, fr_map):
     """每轮重新计算持仓的实时评分（考虑当前K线+FR状态）"""
     channel = pos_info.get("channel", "?")
@@ -907,35 +920,51 @@ def scan_dual_channel():
 
         chain_bonus, chain_tags = get_chain_score(ticker)
 
-        # ===== 通道A: 极端FR =====
+        # ===== 通道A: 极端FR + 技术指标验证（方案5改进：多空兼顾）=====
         if fr is not None:
             abs_fr = abs(fr)
             if FR_EXTREME_THRESHOLD <= abs_fr <= FR_MAX_THRESHOLD:
-                # 复盘验证: 只做FR<0做多
-                if fr < 0:
-                    # 必须有放量信号（避免低流动性滑点）
-                    vol_1m_a = mt.get("vol_1m", 0)
-                    if vol_1m_a >= CHANNEL_A_VOL_SPIKE:
-                        # 跟踪FR持久性
-                        now = time.time()
-                        prev = FR_HISTORY.get(sym)
-                        persistence_bonus = 0
-                        if prev and (now - prev["ts"]) < FR_HISTORY_TTL:
-                            if prev["fr"] < 0 and fr < 0:
-                                persistence_bonus = 1
-                        FR_HISTORY[sym] = {"fr": fr, "ts": now}
+                vol_1m_a = mt.get("vol_1m", 0)
+                if vol_1m_a >= CHANNEL_A_VOL_SPIKE:
+                    chg_5m_a = mt.get("chg_5m", 0)
+                    trend_15m_a = mt.get("trend_15m", "FLAT")
+                    rsi_a = mt.get("rsi_14", 50)
+                    
+                    # FR<0做多：需要5m上涨或15m向上
+                    if fr < 0 and (chg_5m_a > 0.1 or trend_15m_a == "UP"):
+                        # 做多额外过滤：RSI不能超买
+                        if rsi_a > 70:
+                            continue
+                        direction_a = "LONG"
+                    # FR>0做空：需要5m下跌且15m向下
+                    elif fr > 0 and chg_5m_a < -0.1 and trend_15m_a == "DOWN":
+                        # 做空额外过滤：RSI不能超卖
+                        if rsi_a < 30:
+                            continue
+                        direction_a = "SHORT"
+                    else:
+                        continue
+                    
+                    # 跟踪FR持久性
+                    now = time.time()
+                    prev = FR_HISTORY.get(sym)
+                    persistence_bonus = 0
+                    if prev and (now - prev["ts"]) < FR_HISTORY_TTL:
+                        if (prev["fr"] < 0 and fr < 0) or (prev["fr"] > 0 and fr > 0):
+                            persistence_bonus = 1
+                    FR_HISTORY[sym] = {"fr": fr, "ts": now}
 
-                        channel_a_candidates.append({
-                            "sym": sym,
-                            "dir": "LONG",
-                            "fr": fr,
-                            "abs_fr": abs_fr,
-                            "vol24h": item["vol24h"],
-                            "score": abs_fr * 10000 + persistence_bonus + chain_bonus,
-                            "channel": "A",
-                            "chain_tags": chain_tags,
-                            "position_pct": CHANNEL_A_POSITION_PCT,
-                        })
+                    channel_a_candidates.append({
+                        "sym": sym,
+                        "dir": direction_a,
+                        "fr": fr,
+                        "abs_fr": abs_fr,
+                        "vol24h": item["vol24h"],
+                        "score": abs_fr * 10000 + persistence_bonus + chain_bonus,
+                        "channel": "A",
+                        "chain_tags": chain_tags,
+                        "position_pct": CHANNEL_A_POSITION_PCT,
+                    })
 
         # ===== 通道B: 动量顺势 =====
         if mt and "chg_5m" in mt:
@@ -957,6 +986,11 @@ def scan_dual_channel():
             mom_score = calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_15m, direction, mt)
 
             if mom_score >= MOMENTUM_SCORE_THRESHOLD:
+                # 做空安全检查（方案6）
+                if direction == "SHORT":
+                    safe, reason = check_short_safety(mt)
+                    if not safe:
+                        continue
                 channel_b_candidates.append({
                     "sym": sym,
                     "dir": direction,
@@ -1218,22 +1252,39 @@ def monitor_position(inst_id, pos_info):
         close_position(inst_id, pos_info.get("algo_ids"))
         return "PROFIT"
 
-    # 时间止损
-    if elapsed > TIME_STOP_SEC and abs(pct_change) < 0.3:
-        log(f"⏰ {inst_id} 横盘{int(elapsed)}秒 ({pct_change:+.3f}%) → 时间止损")
-        close_position(inst_id, pos_info.get("algo_ids"))
-        return "TIME_STOP"
+    # 时间止损（方案3+7改进）
+    if elapsed > TIME_STOP_SEC:
+        # 8分钟后：浮盈>0.5%→保本追踪，浮盈>0→再等3分钟，否则止损
+        if pct_change >= 0.5:
+            # 浮盈>0.5%，移动止损到开仓价（保本），然后让追踪止损接管
+            if not pos_info.get("trail_activated"):
+                pos_info["trail_activated"] = True
+                pos_info["highest_pnl_pct"] = pct_change
+                log(f"🔔 {inst_id} 8分钟+浮盈{pct_change:+.2f}%>0.5% → 保本追踪激活")
+            return "HOLDING"
+        elif pct_change > 0:
+            # 浮盈0~0.5%，再给3分钟机会（总共11分钟）
+            if elapsed > TIME_STOP_SEC + 180:
+                log(f"⏰ {inst_id} 横盘{int(elapsed)}秒 ({pct_change:+.3f}%) → 时间止损(延长)")
+                close_position(inst_id, pos_info.get("algo_ids"))
+                return "TIME_STOP"
+        else:
+            # 浮亏，8分钟到了直接止损
+            log(f"⏰ {inst_id} 横盘{int(elapsed)}秒 ({pct_change:+.3f}%) → 时间止损")
+            close_position(inst_id, pos_info.get("algo_ids"))
+            return "TIME_STOP"
 
     return "HOLDING"
 
 # ==================== 主循环 ====================
 def main():
     log("=" * 60)
-    log("🔥 OKX 妖币猎手 v7.5 启动（4仓位独立管理+急速上升检测）")
+    log("🔥 OKX 妖币猎手 v7.6 启动（2仓位+多空兼顾+硬性过滤）")
     log(f"  杠杆: {LEVERAGE}x  TP: {TP_PCT*100}%  SL: {SL_PCT*100}%")
-    log(f"  通道A: FR>{FR_EXTREME_THRESHOLD*100}%做多 仓位{CHANNEL_A_POSITION_PCT*100:.0f}%")
+    log(f"  通道A: |FR|>{FR_EXTREME_THRESHOLD*100}%+技术指标验证 仓位{CHANNEL_A_POSITION_PCT*100:.0f}%")
     log(f"  通道B: 动量评分>={MOMENTUM_SCORE_THRESHOLD} 顺势 仓位{CHANNEL_B_POSITION_PCT*100:.0f}%")
     log(f"  追踪止损: 激活{TRAIL_ACTIVATE*100}% 距离{TRAIL_DISTANCE*100}%")
+    log(f"  时间止损: {TIME_STOP_SEC}秒(浮盈>0.5%保本追踪)")
     log(f"  最大同时持仓: {MAX_CONCURRENT}")
     log("=" * 60)
 
@@ -1496,17 +1547,21 @@ def main():
                     break
 
             if slot1_id:
-                # 检查换仓条件: FR消失或变正（开仓理由不存在）
+                # 检查换仓条件: FR消失或方向反了（方案5：多空兼顾）
                 pos_info = positions[slot1_id]
                 fr_val = fr_map.get(slot1_id)
                 need_swap_a = False
+                pos_dir = pos_info.get("direction", "LONG")
                 # 优先用FR直接判断
                 if fr_val is not None:
                     if abs(fr_val) < FR_EXTREME_THRESHOLD:
                         log(f"  🔄 [仓位1] {slot1_id} FR消失(|FR|={abs(fr_val)*100:.4f}%<{FR_EXTREME_THRESHOLD*100}%) → 需要换仓")
                         need_swap_a = True
-                    elif fr_val > 0:
-                        log(f"  🔄 [仓位1] {slot1_id} FR变正({fr_val*100:+.4f}%) → 需要换仓")
+                    elif pos_dir == "LONG" and fr_val > 0:
+                        log(f"  🔄 [仓位1] {slot1_id} 做多但FR变正({fr_val*100:+.4f}%) → 需要换仓")
+                        need_swap_a = True
+                    elif pos_dir == "SHORT" and fr_val < 0:
+                        log(f"  🔄 [仓位1] {slot1_id} 做空但FR变负({fr_val*100:+.4f}%) → 需要换仓")
                         need_swap_a = True
                 else:
                     # FR数据不可用，用recalc评分兜底
@@ -1563,22 +1618,31 @@ def main():
                     break
 
             if slot2_id:
-                # 检查换仓条件: 方向反转或评分归零（开仓理由不存在）
+                # 检查换仓条件: 方向反转或（评分归零+价格跌破开仓价）（方案4改进）
                 pos_info = positions[slot2_id]
                 pos_score = pos_info.get("score", 0)
                 need_swap_b = False
 
-                if pos_score == 0:
-                    log(f"  🔄 [仓位2] {slot2_id} 评分归零 → 需要换仓")
+                # 获取当前价格判断是否价格也反了
+                _d2 = curl_json(f"https://www.okx.com/api/v5/market/ticker?instId={slot2_id}", 5)
+                _cur_px2 = float(_d2["data"][0]["last"]) if _d2.get("data") else pos_info.get("entry_price", 0)
+                _entry2 = pos_info.get("entry_price", 0)
+                if pos_info.get("direction") == "LONG":
+                    _px_adverse = _cur_px2 < _entry2 * 0.995  # 跌破0.5%
+                else:
+                    _px_adverse = _cur_px2 > _entry2 * 1.005  # 涨破0.5%
+
+                if pos_score == 0 and _px_adverse:
+                    log(f"  🔄 [仓位2] {slot2_id} 评分归零+价格反向 → 需要换仓")
                     need_swap_b = True
                 elif pos_info.get("direction") == "LONG":
                     chg = mt_data_map.get(slot2_id, {}).get("chg_5m", 0)
-                    if chg < -0.1:
+                    if chg < -0.3:
                         log(f"  🔄 [仓位2] {slot2_id} 做多但5m转跌({chg:+.2f}%) → 需要换仓")
                         need_swap_b = True
                 elif pos_info.get("direction") == "SHORT":
                     chg = mt_data_map.get(slot2_id, {}).get("chg_5m", 0)
-                    if chg > 0.1:
+                    if chg > 0.3:
                         log(f"  🔄 [仓位2] {slot2_id} 做空但5m转涨({chg:+.2f}%) → 需要换仓")
                         need_swap_b = True
 
@@ -1615,121 +1679,6 @@ def main():
                                 positions[top_b["sym"]] = pos
                             save_state(state)
                             balance = get_balance()  # 刷新余额供后续仓位使用
-
-            # ============================================================
-            # 仓位3/4管理: 急速上升候选
-            # ============================================================
-            # 找出已开的急速上升仓位
-            rising_slot_ids = {}
-            for pid, pinfo in positions.items():
-                ch = pinfo.get("channel", "")
-                if ch == "RISING3":
-                    rising_slot_ids[3] = pid
-                elif ch == "RISING4":
-                    rising_slot_ids[4] = pid
-
-            # 检查急速上升仓位的换仓条件（同通道A/B的保守换仓逻辑）
-            for slot_num in [3, 4]:
-                pid = rising_slot_ids.get(slot_num)
-                if not pid:
-                    continue
-                pos_info = positions[pid]
-                need_swap_r = False
-                src_channel = pos_info.get("source_channel", "B")  # 来源通道
-
-                if src_channel == "A":
-                    # 来源通道A → FR消失/变正才换
-                    fr_val = fr_map.get(pid)
-                    if fr_val is not None:
-                        if abs(fr_val) < FR_EXTREME_THRESHOLD:
-                            need_swap_r = True
-                            log(f"  🔄 [仓位{slot_num}] {pid} FR消失 → 需要换仓")
-                        elif fr_val > 0:
-                            need_swap_r = True
-                            log(f"  🔄 [仓位{slot_num}] {pid} FR变正 → 需要换仓")
-                    else:
-                        # FR数据不可用，用recalc评分兜底
-                        recalc_score, _ = recalc_position_score(pid, pos_info, mt_data_map, fr_map)
-                        if recalc_score == 0:
-                            need_swap_r = True
-                            log(f"  🔄 [仓位{slot_num}] {pid} FR不可用+评分为0 → 需要换仓")
-                else:
-                    # 来源通道B → 方向反转/评分归零才换
-                    if pos_info.get("score", 0) == 0:
-                        need_swap_r = True
-                        log(f"  🔄 [仓位{slot_num}] {pid} 评分归零 → 需要换仓")
-                    elif pos_info.get("direction") == "LONG":
-                        chg = mt_data_map.get(pid, {}).get("chg_5m", 0)
-                        if chg < -0.1:
-                            need_swap_r = True
-                            log(f"  🔄 [仓位{slot_num}] {pid} 做多但5m转跌 → 需要换仓")
-                    elif pos_info.get("direction") == "SHORT":
-                        chg = mt_data_map.get(pid, {}).get("chg_5m", 0)
-                        if chg > 0.1:
-                            need_swap_r = True
-                            log(f"  🔄 [仓位{slot_num}] {pid} 做空但5m转涨 → 需要换仓")
-
-                if need_swap_r:
-                    last_swap = swap_cooldown_map.get(f"slot{slot_num}", 0)
-                    if now_ts - last_swap < SWAP_COOLDOWN:
-                        remaining = int(SWAP_COOLDOWN - (now_ts - last_swap))
-                        log(f"  ⏳ [仓位{slot_num}] 换仓冷却中({remaining}s)")
-                    else:
-                        close_position(pid, pos_info.get("algo_ids"))
-                        time.sleep(1)
-                        with positions_lock:
-                            if pid in positions:
-                                del positions[pid]
-                        state["last_trade"][pid] = now_ts
-                        swap_cooldown_map[f"slot{slot_num}"] = now_ts
-                        del rising_slot_ids[slot_num]
-                        save_state(state)
-
-            # 开急速上升仓位（只在快照满5个且有空位时）
-            available_rising_slots = [s for s in [3, 4] if s not in rising_slot_ids]
-
-            if available_rising_slots and snap_count >= SNAPSHOT_SIZE and balance >= 1:
-                analysis = analyze_rank_changes(candidate_snapshots)
-                occupied_syms = set(positions.keys())
-                rising_candidates = select_rising_candidates(analysis, occupied_syms)
-
-                if rising_candidates:
-                    log(f"  📈 急速上升候选:")
-                    for r in rising_candidates:
-                        log(f"    [{r['channel']}] {r['sym']} {'↑' if r['dir']=='LONG' else '↓'} "
-                            f"rank {r['rank_history'][0]}→{r['rank_history'][-1]} "
-                            f"(+{r['rank_delta']}位, 评分{r['score_history'][0]:.1f}→{r['score_history'][-1]:.1f})")
-
-                    for slot_num, cand in zip(available_rising_slots, rising_candidates):
-                        balance = get_balance()
-                        if balance < 1:
-                            break
-                        if not is_cooled(cand["sym"]) or cand["sym"] in positions:
-                            continue
-
-                        per_slot = balance * SLOT_3_4_PCT
-                        ch_label = f"RISING{slot_num}"
-                        log(f"🔥 [仓位{slot_num}] {cand['sym']} {cand['dir']} "
-                            f"rank_delta=+{cand['rank_delta']} 仓位${per_slot:.2f}")
-                        pos = open_position(cand["sym"], cand["dir"], per_slot, ch_label)
-                        if pos:
-                            pos["score"] = cand.get("score_delta", 0)
-                            pos["source_channel"] = cand["channel"]  # 记录来源通道
-                            with positions_lock:
-                                positions[cand["sym"]] = pos
-                            save_state(state)
-                        time.sleep(5)
-
-                    # 开完仓后清空快照，保留最后一个作为新起点
-                    if len(candidate_snapshots) >= SNAPSHOT_SIZE:
-                        last_snap = candidate_snapshots[-1]
-                        candidate_snapshots.clear()
-                        candidate_snapshots.append(last_snap)
-                        log(f"  🧹 清空快照队列，保留最后一个作为新起点")
-                else:
-                    log(f"  ⏳ 无急速上升候选")
-            elif snap_count < SNAPSHOT_SIZE and available_rising_slots:
-                pass  # 已在上方打印等待信息
 
             # 打印持仓实时状态
             if positions:
