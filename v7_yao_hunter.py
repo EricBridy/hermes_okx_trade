@@ -386,14 +386,19 @@ def get_chain_score(ticker_symbol):
             score += 1
             tags.append(f"鲸{sm_pct:.1f}%")
 
-        # 3. 持仓集中度（insiderHoldingPercent > 5% → +2, > 2% → +1）
+        # 3. 持仓集中度（insiderHoldingPercent 是风险信号！越高=内部人持仓越多=rug风险越大）
+        # insider > 5% → -2分（高风险）, > 2% → -1分（中风险）
+        # insider < 0.5% → +1分（去中心化，正面信号）
         insider_pct = metrics.get("insider_pct", 0)
         if insider_pct > 5:
-            score += 2
-            tags.append(f"集{insider_pct:.1f}%")
+            score -= 2
+            tags.append(f"⚠️集{insider_pct:.1f}%")
         elif insider_pct > 2:
+            score -= 1
+            tags.append(f"⚠集{insider_pct:.1f}%")
+        elif insider_pct < 0.5 and insider_pct > 0:
             score += 1
-            tags.append(f"集{insider_pct:.1f}%")
+            tags.append(f"去中心化")
 
     return score, tags
 
@@ -581,7 +586,7 @@ def get_multi_timeframe(sym):
         return {}
 
 def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_15m=None, chg_5m_dir=None, mt_data=None):
-    """通道B综合评分（满分23，含6个链上因子）"""
+    """通道B综合评分（满分22，含6个链上因子，集中度为减分项）"""
     score = 0
 
     # 0. 15m趋势一致性检查（一票否决）
@@ -1287,8 +1292,8 @@ def main():
                 unified_queue.append(c)
 
             for c in channel_b:
-                # 通道B: score范围0-23(含6个链上因子)，归一化到0-100
-                score_100 = min(c["score"] / 23.0 * 100, 100)
+                # 通道B: score范围0-22(含6个链上因子，集中度为减分项)，归一化到0-100
+                score_100 = min(c["score"] / 22.0 * 100, 100)
                 c["score_100"] = score_100
                 unified_queue.append(c)
 
@@ -1337,7 +1342,7 @@ def main():
                 if pinfo.get("channel") == "A":
                     pos_scores_100[pid] = min(pinfo.get("score", 0) / 10.0 * 100, 100)
                 else:
-                    pos_scores_100[pid] = min(pinfo.get("score", 0) / 23.0 * 100, 100)
+                    pos_scores_100[pid] = min(pinfo.get("score", 0) / 22.0 * 100, 100)
 
             # Top N候选
             top_candidates = cooled[:MAX_CONCURRENT]
