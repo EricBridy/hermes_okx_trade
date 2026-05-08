@@ -23,9 +23,10 @@ TRAIL_DISTANCE = 0.008  # 追踪止损距离0.8%
 TIME_STOP_SEC = 900     # 15分钟时间止损
 SCAN_INTERVAL = 30      # 30秒扫描
 COOLDOWN_SEC = 1200     # 同一品种冷却20分钟
-MAX_CONCURRENT = 5      # 最多同时持仓5个
+MAX_CONCURRENT = 2      # 持有候选队列Top 2（动态）
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_PAUSE_SEC = 1800   # 连亏暂停30分钟
+SWAP_THRESHOLD = 10     # 换仓阈值：候选比持仓高10分才换（覆盖手续费）
 
 # 通道A: 极端FR
 FR_EXTREME_THRESHOLD = 0.0005   # |FR| > 0.05% 触发通道A
@@ -453,6 +454,31 @@ def get_multi_timeframe(sym):
                 else:
                     result['5m_consecutive'] = 'NONE'
 
+                # === 动量衰减检测（新）===
+                # 连续3根5m的涨跌幅递减 = 动量在消退
+                if len(cl5) >= 4:
+                    chg1 = abs((cl5[-1] - cl5[-2]) / cl5[-2] * 100)
+                    chg2 = abs((cl5[-2] - cl5[-3]) / cl5[-3] * 100)
+                    chg3 = abs((cl5[-3] - cl5[-4]) / cl5[-4] * 100)
+                    if chg1 < chg2 < chg3:
+                        result['momentum_decay'] = True  # 动量递减
+                    else:
+                        result['momentum_decay'] = False
+
+                # === 量价背离检测（新）===
+                # 价格创新高但成交量递减 → 假突破信号
+                if len(cl5) >= 3 and len(vl5) >= 3:
+                    price_higher = cl5[-1] > cl5[-2] > cl5[-3]
+                    vol_lower = vl5[-1] < vl5[-2] < vl5[-3]
+                    price_lower = cl5[-1] < cl5[-2] < cl5[-3]
+                    # 上涨时量缩 = 顶背离；下跌时量缩 = 底背离（对做空是风险）
+                    if price_higher and vol_lower:
+                        result['vol_price_diverge'] = 'TOP'  # 顶背离：价涨量缩
+                    elif price_lower and vol_lower:
+                        result['vol_price_diverge'] = 'BOTTOM'  # 底背离：价跌量缩
+                    else:
+                        result['vol_price_diverge'] = 'NONE'
+
         # 15分钟趋势（新增）
         if c15m.get("data") and len(c15m["data"]) >= 4:
             c15 = c15m["data"][::-1]
@@ -502,6 +528,18 @@ def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_
             return 0  # 做多但最近3根1m全阴 = 正在反转
         if chg_5m_dir == "SHORT" and last3_up >= 3:
             return 0  # 做空但最近3根1m全阳 = 正在反转
+
+    # 0e. 动量衰减（一票否决）— 3根5m涨跌幅递减
+    if mt_data and mt_data.get("momentum_decay"):
+        return 0  # 动量在消退，追进去就是接盘
+
+    # 0f. 量价背离（一票否决）
+    if mt_data:
+        diverge = mt_data.get("vol_price_diverge", "NONE")
+        if chg_5m_dir == "LONG" and diverge == "TOP":
+            return 0  # 价涨量缩 = 假突破
+        if chg_5m_dir == "SHORT" and diverge == "BOTTOM":
+            return 0  # 价跌量缩 = 假跌破
 
     # 0d. 5m连续确认
     consecutive_bonus = 0
@@ -555,6 +593,55 @@ def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_
 
     return score
 
+def recalc_position_score(inst_id, pos_info, mt_data_map, fr_map):
+    """每轮重新计算持仓的实时评分（考虑当前K线+FR状态）"""
+    channel = pos_info.get("channel", "?")
+    direction = pos_info.get("direction", "?")
+    ticker = inst_id.replace("-USDT-SWAP", "")
+    
+    # 获取当前数据
+    mt = mt_data_map.get(inst_id, {})
+    fr = fr_map.get(inst_id)
+    chain_bonus, chain_tags = get_chain_score(ticker)
+    
+    if channel == "A":
+        # 通道A评分 = FR强度 + 持久性 + 链上 + 放量
+        if fr is None:
+            return pos_info.get("score", 0), chain_tags
+        abs_fr = abs(fr)
+        if abs_fr < FR_EXTREME_THRESHOLD:
+            return 0, chain_tags  # FR已消失，评分归零
+        vol_1m = mt.get("vol_1m", 0)
+        score = abs_fr * 10000 + chain_bonus
+        if vol_1m >= CHANNEL_A_VOL_SPIKE:
+            score += 1
+        return score, chain_tags
+    
+    elif channel == "B":
+        # 通道B重新计算完整评分
+        if "chg_5m" not in mt:
+            return pos_info.get("score", 0), chain_tags
+        
+        chg_5m = mt.get("chg_5m", 0)
+        vol_1m = mt.get("vol_1m", 0)
+        ups = mt.get("ups", 0)
+        downs = mt.get("downs", 0)
+        trend_15m = mt.get("trend_15m", None)
+        
+        # 检查方向是否反转
+        if direction == "LONG" and chg_5m < -0.1:
+            return 0, chain_tags  # 5m已转跌，该跑了
+        if direction == "SHORT" and chg_5m > 0.1:
+            return 0, chain_tags  # 5m已转涨，该跑了
+        
+        score = calculate_momentum_score(
+            chg_5m, vol_1m, ups, downs, chain_bonus, fr,
+            trend_15m, direction, mt
+        )
+        return score, chain_tags
+    
+    return pos_info.get("score", 0), []
+
 # ==================== 双通道扫描 ====================
 def scan_dual_channel():
     """双通道扫描：通道A(极端FR) + 通道B(动量顺势)"""
@@ -584,10 +671,11 @@ def scan_dual_channel():
     # 2. 并行获取资金费率
     fr_map = get_funding_rates_batch(syms)
 
-    # 3. 并行获取K线数据（只对前30个，并发10避免限流50011）
+    # 3. 并行获取K线数据（候选 + 持仓，都要K线数据）
+    kline_syms = list(set(syms[:30] + [p for p in positions if p in syms]))
     mt_data = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
-        futures = {ex.submit(get_multi_timeframe, s): s for s in syms[:30]}
+        futures = {ex.submit(get_multi_timeframe, s): s for s in kline_syms}
         for f in as_completed(futures):
             sym = futures[f]
             try:
@@ -678,7 +766,7 @@ def scan_dual_channel():
     channel_a_candidates.sort(key=lambda x: x["score"], reverse=True)
     channel_b_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    return channel_a_candidates, channel_b_candidates
+    return channel_a_candidates, channel_b_candidates, mt_data, fr_map
 
 # ==================== 交易操作 ====================
 def get_balance():
@@ -1094,124 +1182,106 @@ def main():
                                 del positions[inst_id]
 
             # ===== 双通道扫描 =====
-            active_count = len(positions)
-            need_scan = active_count < MAX_CONCURRENT
+            scan_count += 1
+            balance = get_balance()
+            log(f"📡 扫描#{scan_count} 余额:${balance:.2f} 仓位:{len(positions)}")
 
-            # 即使仓位满了，也扫描看有没有高分候选（用于淘汰低分持仓）
-            if not need_scan:
-                need_scan = True  # 永远扫描，后面判断是否替换
+            channel_a, channel_b, mt_data_map, fr_map = scan_dual_channel()
 
-            if need_scan:
-                scan_count += 1
-                balance = get_balance()
-                log(f"📡 扫描#{scan_count} 余额:${balance:.2f} 仓位:{active_count}/{MAX_CONCURRENT}")
+            # === 1. 重新评分所有持仓 ===
+            for inst_id in list(positions.keys()):
+                if inst_id in mt_data_map or inst_id in fr_map:
+                    new_score, tags = recalc_position_score(
+                        inst_id, positions[inst_id], mt_data_map, fr_map
+                    )
+                    old_score = positions[inst_id].get("score", 0)
+                    positions[inst_id]["score"] = new_score
+                    if abs(new_score - old_score) >= 3:
+                        log(f"  📊 {inst_id} 评分变化: {old_score}→{new_score} [{','.join(tags)}]")
 
-                channel_a, channel_b = scan_dual_channel()
+            # === 2. 统一候选队列（归一化到0-100分）===
+            unified_queue = []  # (score_100, candidate_dict)
 
-                # 打印通道A候选
-                if channel_a:
-                    log(f"  🔴 通道A(FR反向): {len(channel_a)}个候选")
-                    for c in channel_a[:3]:
-                        tags = f"[{','.join(c['chain_tags'])}]" if c.get("chain_tags") else ""
-                        log(f"    {c['sym']} ↑多 FR={c['fr']*100:+.4f}% score={c['score']} vol=${c['vol24h']/1e6:.0f}M {tags}")
+            for c in channel_a:
+                # 通道A: score范围约1-10，归一化到0-100
+                score_100 = min(c["score"] / 10.0 * 100, 100)
+                c["score_100"] = score_100
+                unified_queue.append(c)
 
-                # 打印通道B候选
-                if channel_b:
-                    log(f"  🔵 通道B(动量): {len(channel_b)}个候选")
-                    for c in channel_b[:3]:
-                        tags = f"[{','.join(c['chain_tags'])}]" if c.get("chain_tags") else ""
-                        log(f"    {c['sym']} {'↑' if c['dir']=='LONG' else '↓'} 5m:{c.get('chg_5m',0):+.2f}% 15m:{c.get('trend_15m','?')} score:{c['score']} {tags}")
+            for c in channel_b:
+                # 通道B: score范围0-16，归一化到0-100
+                score_100 = min(c["score"] / 16.0 * 100, 100)
+                c["score_100"] = score_100
+                unified_queue.append(c)
 
-                if not channel_a and not channel_b:
-                    log(f"  ⏳ 双通道均无信号，等待...")
-                    time.sleep(SCAN_INTERVAL)
-                    continue
+            # 去重（同一sym不重复）
+            seen = set()
+            deduped = []
+            for c in unified_queue:
+                if c["sym"] not in seen and c["sym"] not in positions:
+                    seen.add(c["sym"])
+                    deduped.append(c)
+            deduped.sort(key=lambda x: x["score_100"], reverse=True)
 
-                # 合并候选，优先通道A，去重
-                all_candidates = []
-                seen_syms = set()
-                for c in channel_a:
-                    if c["sym"] not in seen_syms:
-                        all_candidates.append(c)
-                        seen_syms.add(c["sym"])
-                for c in channel_b:
-                    if c["sym"] not in seen_syms:
-                        all_candidates.append(c)
-                        seen_syms.add(c["sym"])
+            # 冷却过滤
+            now_ts = time.time()
+            cooled = []
+            for c in deduped:
+                last = state.get("last_trade", {}).get(c["sym"], 0)
+                if now_ts - last < COOLDOWN_SEC:
+                    remaining = int(COOLDOWN_SEC - (now_ts - last))
+                    log(f"  ⏳ {c['sym']} 冷却中({remaining}s)")
+                else:
+                    cooled.append(c)
 
-                # 冷却检查 + 去重持仓
-                now_ts = time.time()
-                cooled = []
-                for c in all_candidates:
-                    if c["sym"] in positions:
-                        log(f"  ⏳ {c['sym']} 已有持仓，跳过")
-                        continue
-                    last = state.get("last_trade", {}).get(c["sym"], 0)
-                    if now_ts - last < COOLDOWN_SEC:
-                        remaining = int(COOLDOWN_SEC - (now_ts - last))
-                        log(f"  ⏳ {c['sym']} 冷却中({remaining}s)")
-                    else:
-                        cooled.append(c)
+            # 打印候选队列Top5
+            if cooled:
+                log(f"  📋 候选队列Top5:")
+                for c in cooled[:5]:
+                    tags = f"[{','.join(c.get('chain_tags',[]))}]" if c.get("chain_tags") else ""
+                    log(f"    [{c['channel']}] {c['sym']} {'↑' if c['dir']=='LONG' else '↓'} "
+                        f"score={c['score']}({c['score_100']:.0f}/100) {tags}")
+            else:
+                log(f"  ⏳ 无候选")
 
-                if not cooled:
-                    log(f"  ⏳ 所有候选品种均在冷却中")
-                    time.sleep(SCAN_INTERVAL)
-                    continue
+            # === 3. 决策引擎：候选队列Top2 vs 持仓 ===
+            near_settle, settle_secs = is_near_settlement()
+            if near_settle:
+                log(f"  ⏳ 距资金费率结算仅{settle_secs//60}分钟，暂停开仓")
+                time.sleep(60)
+                continue
 
-                # 结算检查
-                near_settle, settle_secs = is_near_settlement()
-                if near_settle:
-                    log(f"  ⏳ 距资金费率结算仅{settle_secs//60}分钟，暂停开仓")
-                    time.sleep(60)
-                    continue
+            # 构建持仓排名（按score升序 = 最差在前）
+            pos_ranked = sorted(positions.items(), key=lambda x: x[1].get("score", 0))
+            # 归一化持仓评分
+            pos_scores_100 = {}
+            for pid, pinfo in pos_ranked:
+                if pinfo.get("channel") == "A":
+                    pos_scores_100[pid] = min(pinfo.get("score", 0) / 10.0 * 100, 100)
+                else:
+                    pos_scores_100[pid] = min(pinfo.get("score", 0) / 16.0 * 100, 100)
 
-                # ===== 动态仓位管理：有空位就开，没空位看能否替换 =====
-                active_count = len(positions)
-                slots_available = MAX_CONCURRENT - active_count
+            # Top N候选
+            top_candidates = cooled[:MAX_CONCURRENT]
 
-                if slots_available <= 0 and cooled:
-                    # 仓位满了，看最高分候选是否能替换最低分持仓
-                    best_cand = cooled[0]  # 已按score排序
-                    # 找持仓中评分最低的
-                    if positions:
-                        lowest_pos_id = min(positions.keys(), key=lambda k: positions[k].get("score", 0))
-                        lowest_score = positions[lowest_pos_id].get("score", 0)
-                        if best_cand["score"] > lowest_score:
-                            log(f"  🔄 淘汰低分: {lowest_pos_id}(score={lowest_score}) → 开高分: {best_cand['sym']}(score={best_cand['score']})")
-                            close_position(lowest_pos_id, positions[lowest_pos_id].get("algo_ids"))
-                            time.sleep(1)
-                            if lowest_pos_id in positions:
-                                with positions_lock:
-                                    del positions[lowest_pos_id]
-                            state["last_trade"][lowest_pos_id] = time.time()
-                            slots_available += 1
-                        else:
-                            log(f"  ⏳ 最高候选score={best_cand['score']} ≤ 最低持仓score={lowest_score}，不替换")
-                            time.sleep(SCAN_INTERVAL)
-                            continue
-
-                # 开仓
-                n_open = min(len(cooled), slots_available)
-                if balance >= 1 and n_open > 0:
-                    candidates_to_open = cooled[:n_open]
-                    if len(candidates_to_open) >= 2:
-                        weights = []
-                        for c in candidates_to_open:
-                            w = 1.5 if c["channel"] == "A" else 1.0
-                            weights.append(w)
-                        total_w = sum(weights)
-                        for i, c in enumerate(candidates_to_open):
-                            c["position_pct"] = (weights[i] / total_w) * 0.95
-                        log(f"  📊 多仓分配: " + ", ".join(
-                            f"[{c['channel']}]{c['sym']}={c['position_pct']*100:.0f}%" for c in candidates_to_open))
-
-                    for cand in candidates_to_open:
+            if len(cooled) > 0 and balance >= 1:
+                # 有空位：直接开top候选
+                slots_available = MAX_CONCURRENT - len(positions)
+                if slots_available > 0:
+                    n_open = min(len(top_candidates), slots_available)
+                    for cand in top_candidates[:n_open]:
                         balance = get_balance()
                         if balance < 1:
-                            log(f"  ⏳ 余额不足(${balance:.2f})，停止开仓")
                             break
-                        per_slot = balance * cand["position_pct"]
-                        log(f"🔥 [{cand['channel']}] {cand['sym']} {cand['dir']} FR={cand.get('fr',0)*100:+.4f}% score:{cand['score']} 仓位{cand['position_pct']*100:.0f}%")
+                        # 按权重分配余额
+                        total_weight = sum(
+                            1.5 if c["channel"] == "A" else 1.0
+                            for c in top_candidates[:n_open]
+                        )
+                        my_weight = 1.5 if cand["channel"] == "A" else 1.0
+                        per_slot = balance * (my_weight / total_weight) * 0.95
+                        log(f"🔥 [{cand['channel']}] {cand['sym']} {cand['dir']} "
+                            f"score:{cand['score']}({cand['score_100']:.0f}/100) 仓位{per_slot/balance*100:.0f}%")
                         pos = open_position(cand["sym"], cand["dir"], per_slot, cand["channel"])
                         if pos:
                             pos["fr"] = cand.get("fr", 0)
@@ -1220,6 +1290,50 @@ def main():
                                 positions[cand["sym"]] = pos
                             save_state(state)
                         time.sleep(5)
+
+                # 无空位：检查是否有值得换仓的
+                elif len(pos_ranked) > 0 and len(cooled) > 0:
+                    # 最佳候选 vs 最差持仓（归一化后比较）
+                    best_cand = top_candidates[0]
+                    worst_pos_id, worst_pos = pos_ranked[0]
+                    worst_score_100 = pos_scores_100.get(worst_pos_id, 0)
+                    best_score_100 = best_cand["score_100"]
+
+                    # 评分差 > 换仓阈值（覆盖手续费成本）
+                    score_diff = best_score_100 - worst_score_100
+                    if score_diff >= SWAP_THRESHOLD:
+                        log(f"  🔄 换仓: {worst_pos_id}(score={worst_pos.get('score',0)}→{worst_score_100:.0f}/100) "
+                            f"→ {best_cand['sym']}({best_cand['score']}→{best_score_100:.0f}/100) 差值:{score_diff:.0f}")
+                        close_position(worst_pos_id, positions[worst_pos_id].get("algo_ids"))
+                        time.sleep(1)
+                        if worst_pos_id in positions:
+                            with positions_lock:
+                                del positions[worst_pos_id]
+                        state["last_trade"][worst_pos_id] = time.time()
+
+                        # 开新仓
+                        balance = get_balance()
+                        if balance >= 1:
+                            per_slot = balance * 0.90
+                            log(f"🔥 [{best_cand['channel']}] {best_cand['sym']} {best_cand['dir']} "
+                                f"score:{best_cand['score']} 仓位{per_slot/balance*100:.0f}%")
+                            pos = open_position(best_cand["sym"], best_cand["dir"], per_slot, best_cand["channel"])
+                            if pos:
+                                pos["fr"] = best_cand.get("fr", 0)
+                                pos["score"] = best_cand.get("score", 0)
+                                with positions_lock:
+                                    positions[best_cand["sym"]] = pos
+                        save_state(state)
+                    else:
+                        log(f"  ⏳ Top候选({best_score_100:.0f}) - 最差持仓({worst_score_100:.0f}) "
+                            f"= {score_diff:.0f} < 阈值{SWAP_THRESHOLD}，不换")
+
+            # 打印持仓实时状态
+            if positions:
+                for pid, pinfo in positions.items():
+                    ch = pinfo.get("channel", "?")
+                    sc = pinfo.get("score", 0)
+                    log(f"  💼 [{ch}] {pid} {pinfo.get('direction','?')} score={sc}")
 
             time.sleep(SCAN_INTERVAL)
 
