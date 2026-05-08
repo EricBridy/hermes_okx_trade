@@ -1005,11 +1005,27 @@ def main():
                     time.sleep(60)
                     continue
 
-                # 开仓（每开一仓后重新查余额，避免余额重复使用）
+                # 开仓（动态分配余额，确保每个仓位都有足够资金）
                 slots = MAX_CONCURRENT - active_count
                 n_open = min(len(cooled), slots)
                 if balance >= 1 and n_open > 0:
-                    for cand in cooled[:n_open]:
+                    # 动态分配：当需要同时开多个仓时，按权重分配余额
+                    # 避免第一个仓占90%后第二个仓没钱开
+                    candidates_to_open = cooled[:n_open]
+                    if len(candidates_to_open) >= 2:
+                        # 多仓模式：总仓位不超过余额的95%，按优先级分配
+                        # A通道权重1.5，B通道权重1.0
+                        weights = []
+                        for c in candidates_to_open:
+                            w = 1.5 if c["channel"] == "A" else 1.0
+                            weights.append(w)
+                        total_w = sum(weights)
+                        for i, c in enumerate(candidates_to_open):
+                            c["position_pct"] = (weights[i] / total_w) * 0.95
+                        log(f"  📊 多仓分配: " + ", ".join(
+                            f"[{c['channel']}]{c['sym']}={c['position_pct']*100:.0f}%" for c in candidates_to_open))
+
+                    for cand in candidates_to_open:
                         # 开仓前重新查余额（上一仓可能已扣保证金）
                         balance = get_balance()
                         if balance < 1:
