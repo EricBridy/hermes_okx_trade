@@ -794,12 +794,17 @@ def recalc_position_score(inst_id, pos_info, mt_data_map, fr_map):
     direction = pos_info.get("direction", "?")
     ticker = inst_id.replace("-USDT-SWAP", "")
     
+    # RISING仓位使用source_channel决定评分逻辑
+    effective_channel = channel
+    if channel.startswith("RISING"):
+        effective_channel = pos_info.get("source_channel", "B")
+    
     # 获取当前数据
     mt = mt_data_map.get(inst_id, {})
     fr = fr_map.get(inst_id)
     chain_bonus, chain_tags = get_chain_score(ticker)
     
-    if channel == "A":
+    if effective_channel == "A":
         # 通道A评分 = FR强度 + 持久性 + 链上 + 放量
         if fr is None:
             return pos_info.get("score", 0), chain_tags
@@ -812,7 +817,7 @@ def recalc_position_score(inst_id, pos_info, mt_data_map, fr_map):
             score += 1
         return score, chain_tags
     
-    elif channel == "B":
+    elif effective_channel == "B":
         # 通道B重新计算完整评分
         if "chg_5m" not in mt:
             return pos_info.get("score", 0), chain_tags
@@ -1451,6 +1456,7 @@ def main():
                 pos_info = positions[slot1_id]
                 fr_val = fr_map.get(slot1_id)
                 need_swap_a = False
+                # 优先用FR直接判断
                 if fr_val is not None:
                     if abs(fr_val) < FR_EXTREME_THRESHOLD:
                         log(f"  🔄 [仓位1] {slot1_id} FR消失(|FR|={abs(fr_val)*100:.4f}%<{FR_EXTREME_THRESHOLD*100}%) → 需要换仓")
@@ -1458,6 +1464,14 @@ def main():
                     elif fr_val > 0:
                         log(f"  🔄 [仓位1] {slot1_id} FR变正({fr_val*100:+.4f}%) → 需要换仓")
                         need_swap_a = True
+                else:
+                    # FR数据不可用，用recalc评分兜底
+                    recalc_score, _ = recalc_position_score(slot1_id, pos_info, mt_data_map, fr_map)
+                    if recalc_score == 0:
+                        log(f"  🔄 [仓位1] {slot1_id} FR不可用+评分为0 → 需要换仓")
+                        need_swap_a = True
+                    else:
+                        log(f"  ⚠️ [仓位1] {slot1_id} FR数据不可用，评分={recalc_score}，暂不换仓")
 
                 if need_swap_a:
                     # 检查换仓冷却
@@ -1493,6 +1507,7 @@ def main():
                             with positions_lock:
                                 positions[top_a["sym"]] = pos
                             save_state(state)
+                            balance = get_balance()  # 刷新余额供后续仓位使用
 
             # ============================================================
             # 仓位2管理: 通道B独占
@@ -1555,6 +1570,7 @@ def main():
                             with positions_lock:
                                 positions[top_b["sym"]] = pos
                             save_state(state)
+                            balance = get_balance()  # 刷新余额供后续仓位使用
 
             # ============================================================
             # 仓位3/4管理: 急速上升候选
@@ -1587,6 +1603,12 @@ def main():
                         elif fr_val > 0:
                             need_swap_r = True
                             log(f"  🔄 [仓位{slot_num}] {pid} FR变正 → 需要换仓")
+                    else:
+                        # FR数据不可用，用recalc评分兜底
+                        recalc_score, _ = recalc_position_score(pid, pos_info, mt_data_map, fr_map)
+                        if recalc_score == 0:
+                            need_swap_r = True
+                            log(f"  🔄 [仓位{slot_num}] {pid} FR不可用+评分为0 → 需要换仓")
                 else:
                     # 来源通道B → 方向反转/评分归零才换
                     if pos_info.get("score", 0) == 0:
