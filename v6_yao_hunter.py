@@ -23,7 +23,7 @@ TRAIL_DISTANCE = 0.008  # 追踪止损距离0.8%
 TIME_STOP_SEC = 900     # 15分钟时间止损
 SCAN_INTERVAL = 30      # 30秒扫描
 COOLDOWN_SEC = 1200     # 同一品种冷却20分钟
-MAX_CONCURRENT = 2      # 最多同时持仓2个（两个通道各1个）
+MAX_CONCURRENT = 5      # 最多同时持仓5个
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_PAUSE_SEC = 1800   # 连亏暂停30分钟
 
@@ -47,7 +47,7 @@ OKX_TAKER_FEE = 0.0005          # 0.05% taker
 ROUND_TRIP_FEE = OKX_TAKER_FEE * 2  # 0.1%
 
 # 链上数据
-CHAIN_DATA_TTL = 120       # 2分钟刷新一次（降频减少timeout影响）
+CHAIN_DATA_TTL = 60        # 60秒刷新一次（实时获取）
 CHAIN_BONUS = 2
 CHAIN_API_BASE = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct"
 CHAIN_API_TIMEOUT = 3      # 3秒超时（原8秒太长）
@@ -65,8 +65,7 @@ CHAIN_CACHE = {
     "smart_money_buy": set(),
     "hot_topics": set(),
     "smart_money_inflow": set(),
-    "last_update": 0,
-    "consecutive_failures": 0
+    "last_update": 0
 }
 
 # ==================== 多仓管理 ====================
@@ -284,11 +283,7 @@ def load_chain_cache():
 
 def update_chain_cache():
     now = time.time()
-    # 连续失败时延长TTL（避免反复请求timeout的API）
-    effective_ttl = CHAIN_DATA_TTL
-    if CHAIN_CACHE["consecutive_failures"] >= 3:
-        effective_ttl = CHAIN_DATA_TTL * 4  # 连续失败3次后TTL延长到8分钟
-    if now - CHAIN_CACHE["last_update"] < effective_ttl:
+    if now - CHAIN_CACHE["last_update"] < CHAIN_DATA_TTL:
         return
     with ThreadPoolExecutor(max_workers=3) as ex:
         f_sm = ex.submit(fetch_smart_money_signals)
@@ -298,24 +293,15 @@ def update_chain_cache():
             sm = f_sm.result(timeout=CHAIN_API_TIMEOUT + 2)
             ht = f_ht.result(timeout=CHAIN_API_TIMEOUT + 2)
             inf = f_in.result(timeout=CHAIN_API_TIMEOUT + 2)
-            # 3个API中至少1个返回数据才算成功
-            if sm or ht or inf:
-                CHAIN_CACHE["smart_money_buy"] = sm
-                CHAIN_CACHE["hot_topics"] = ht
-                CHAIN_CACHE["smart_money_inflow"] = inf
-                CHAIN_CACHE["last_update"] = now
-                CHAIN_CACHE["consecutive_failures"] = 0
-                save_chain_cache()  # 成功时持久化
-                log(f"  [chain] SM_buy={len(sm)} topics={len(ht)} SM_inflow={len(inf)}")
-            else:
-                CHAIN_CACHE["consecutive_failures"] += 1
-                log(f"  [chain] 3个API均无数据 (连续失败{CHAIN_CACHE['consecutive_failures']}次，使用缓存)")
+            CHAIN_CACHE["smart_money_buy"] = sm
+            CHAIN_CACHE["hot_topics"] = ht
+            CHAIN_CACHE["smart_money_inflow"] = inf
+            CHAIN_CACHE["last_update"] = now
+            save_chain_cache()  # 持久化到磁盘
+            log(f"  [chain] SM_buy={len(sm)} topics={len(ht)} SM_inflow={len(inf)}")
         except Exception as e:
-            CHAIN_CACHE["consecutive_failures"] += 1
-            log(f"  [chain] API异常: {e} (连续失败{CHAIN_CACHE['consecutive_failures']}次，使用缓存)")
-            # API失败且无缓存时，设置last_update防止反复请求
-            if CHAIN_CACHE["last_update"] == 0:
-                CHAIN_CACHE["last_update"] = now
+            log(f"  [chain] API异常: {e}（保留旧缓存）")
+            CHAIN_CACHE["last_update"] = now
 
 def get_chain_score(ticker_symbol):
     score = 0
@@ -396,12 +382,14 @@ def get_funding_rates_batch(syms):
 
 # ==================== 多时间框架K线分析 ====================
 def get_multi_timeframe(sym):
-    """获取1m/5m K线，计算动量指标"""
+    """获取1m/5m/15m K线，计算动量指标"""
     try:
         # 1分钟K线
         c1m = curl_json(f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar=1m&limit=20", 5)
         # 5分钟K线
         c5m = curl_json(f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar=5m&limit=6", 5)
+        # 15分钟K线（新增）
+        c15m = curl_json(f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar=15m&limit=6", 5)
 
         result = {}
 
@@ -431,13 +419,40 @@ def get_multi_timeframe(sym):
             h5 = sum(vl5[:-2]) / max(len(vl5[:-2]), 1)
             result['vol_5m'] = r5 / max(h5, 0.001)
 
+        # 15分钟趋势（新增）
+        if c15m.get("data") and len(c15m["data"]) >= 4:
+            c15 = c15m["data"][::-1]
+            cl15 = [float(c[4]) for c in c15]
+            # 最近3根15m的涨跌
+            chg_15m_recent = (cl15[-1] - cl15[-2]) / cl15[-2] * 100  # 最近1根
+            chg_15m_2 = (cl15[-1] - cl15[-3]) / cl15[-3] * 100       # 最近2根
+            chg_15m_3 = (cl15[-1] - cl15[-4]) / cl15[-4] * 100       # 最近3根
+            result['chg_15m_recent'] = chg_15m_recent
+            result['chg_15m_2'] = chg_15m_2
+            result['chg_15m_3'] = chg_15m_3
+            # 15m趋势方向：3根都同向才是真趋势
+            if chg_15m_3 > 0.3:
+                result['trend_15m'] = 'UP'
+            elif chg_15m_3 < -0.3:
+                result['trend_15m'] = 'DOWN'
+            else:
+                result['trend_15m'] = 'FLAT'
+
         return result
     except:
         return {}
 
-def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr):
-    """通道B综合评分（满分12）"""
+def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_15m=None, chg_5m_dir=None):
+    """通道B综合评分（满分14）"""
     score = 0
+
+    # 0. 15m趋势一致性检查（一票否决）
+    # 如果5m方向和15m趋势相反，直接返回0分
+    if trend_15m and chg_5m_dir:
+        if chg_5m_dir == "LONG" and trend_15m == "DOWN":
+            return 0  # 5m涨但15m跌 → 不做
+        if chg_5m_dir == "SHORT" and trend_15m == "UP":
+            return 0  # 5m跌但15m涨 → 不做
 
     # 1. 5m涨跌幅度 (1-3分)
     abs_chg = abs(chg_5m)
@@ -468,6 +483,13 @@ def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr):
     # 5. FR方向一致 (+1分)
     if fr is not None:
         if (fr < 0 and chg_5m > 0) or (fr > 0 and chg_5m < 0):
+            score += 1
+
+    # 6. 15m趋势强度加分 (+1分)
+    if trend_15m and chg_5m_dir:
+        if chg_5m_dir == "LONG" and trend_15m == "UP":
+            score += 1
+        elif chg_5m_dir == "SHORT" and trend_15m == "DOWN":
             score += 1
 
     return score
@@ -563,17 +585,18 @@ def scan_dual_channel():
             vol_1m = mt.get("vol_1m", 0)
             ups = mt.get("ups", 0)
             downs = mt.get("downs", 0)
+            trend_15m = mt.get("trend_15m", None)
 
-            # 评分
-            mom_score = calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr)
-
-            # 趋势方向
+            # 先确定方向
             if chg_5m > 0:
                 direction = "LONG"
             elif chg_5m < 0:
                 direction = "SHORT"
             else:
                 continue
+
+            # 评分（传入15m趋势做一致性检查）
+            mom_score = calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_15m, direction)
 
             if mom_score >= MOMENTUM_SCORE_THRESHOLD:
                 channel_b_candidates.append({
