@@ -73,7 +73,7 @@ OKX 永续合约自动化交易系统
 
 ## 参数配置
 
-```python
+```
 # 基础
 LEVERAGE = 6
 TP_PCT = 0.03          # 止盈 3%
@@ -83,7 +83,8 @@ TRAIL_DISTANCE = 0.008  # 追踪距离 0.8%
 TIME_STOP_SEC = 900     # 时间止损 15分钟
 SCAN_INTERVAL = 30      # 扫描间隔 30秒
 COOLDOWN_SEC = 1200     # 品种冷却 20分钟
-MAX_CONCURRENT = 5      # 最大持仓 5个
+MAX_CONCURRENT = 2      # 持有候选队列Top 2（动态）
+SWAP_THRESHOLD = 10     # 换仓阈值：候选比持仓高10分才换
 
 # 通道A
 FR_EXTREME_THRESHOLD = 0.0005   # |FR| > 0.05%
@@ -98,7 +99,7 @@ CHANNEL_B_POSITION_PCT = 0.60   # 仓位 60%
 # 共用
 MIN_24H_VOL = 2000000           # 最小24h成交量 $200万
 OKX_TAKER_FEE = 0.0005          # 0.05% taker
-CHAIN_DATA_TTL = 120            # 链上数据刷新 120秒
+CHAIN_DATA_TTL = 60             # 链上数据刷新 60秒
 CHAIN_API_TIMEOUT = 3           # 链上API超时 3秒
 ```
 
@@ -181,9 +182,14 @@ tail -f ~/.hermes/scripts/v6_trades.log
 | #14 | 小资金下通道A占90%后通道B永远开不了 | 多仓时按权重动态分配余额（A:1.5, B:1.0） |
 | #15 | 链上API全部timeout时chain_bonus永远=0 | 持久化缓存到磁盘，连续失败延长TTL，启动时恢复 |
 | #16 | CLOSED分支用last_upl估算盈亏不精确 | 用OKX账单API查询精确realizedPnl |
-| #17 | MAX_CONCURRENT=2太少 | 提高到5 |
+| #17 | MAX_CONCURRENT=2太少 | 改回2，采用候选队列Top2动态持有+换仓阈值SWAP_THRESHOLD=10 |
 | #18 | 链上API降级逻辑过度保护 | 去掉连续失败延长TTL，改为每次60秒实时获取 |
 | #19 | 通道B只看5m数据判断方向，方向错误率高 | 新增15m趋势一致性一票否决+加分 |
+| #20 | 持仓评分是开仓时的静态值 | 新增recalc_position_score每轮实时重评，FR消失/方向反转→归零 |
+| #21 | 两个通道评分量纲不同无法直接比较 | 归一化到0-100分统一排序 |
+| #22 | 缺少动量衰减检测 | 3根5m涨跌幅递减→一票否决 |
+| #23 | 缺少量价背离检测 | 价涨量缩(顶背离)/价跌量缩(底背离)→一票否决 |
+| #24 | K线数据不覆盖持仓品种 | 持仓也获取K线用于动态评分 |
 
 **v5.1→v6.0 改动依据（全部来自OKX API账单复盘）：**
 
