@@ -30,17 +30,13 @@ MAX_CONCURRENT = 2      # 2仓位: A独占1个+B独占1个（砍掉RISING急速�
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_PAUSE_SEC = 1800   # 连亏暂停30分钟
 SWAP_COOLDOWN = 1800    # 换仓冷却30分钟（防止频繁换仓磨手续费）
-SNAPSHOT_SIZE = 5          # 缓存快照数量(5×30秒=2.5分钟窗口)
-RANK_DELTA_THRESHOLD = 15  # 排名变化阈值(上升15位以上才开仓)
-SLOT_3_4_PCT = 0.50       # 仓位3/4各占剩余资金50%
+# 仓位管理
 
 # 通道A: 极端FR
 FR_EXTREME_THRESHOLD = 0.0005   # |FR| > 0.05% 触发通道A
 FR_MAX_THRESHOLD = 0.01         # |FR| > 1% 跳过（陷阱）
 CHANNEL_A_VOL_SPIKE = 1.3       # 放量阈值
 CHANNEL_A_POSITION_PCT = 0.40   # 仓位1占总资金40%
-# 复盘验证: FR<0做多赚钱，FR>0做空亏钱 → 通道A只做多
-CHANNEL_A_DIRECTION = "LONG"    # 只做多(FR<0)
 
 # 通道B: 动量顺势
 MOMENTUM_SCORE_THRESHOLD = 8    # 综合评分>=8触发通道B
@@ -79,115 +75,7 @@ CHAIN_CACHE = {
 # ==================== 多仓管理 ====================
 positions = {}
 positions_lock = threading.Lock()
-
-# ==================== 候选快照队列 ====================
-candidate_snapshots = []  # 最多SNAPSHOT_SIZE个快照，每30秒一个
 swap_cooldown_map = {}    # 仓位 -> 最后一次换仓时间
-
-def take_snapshot(channel_a, channel_b):
-    """生成当前候选队列快照"""
-    snapshot = {
-        "timestamp": time.time(),
-        "channel_a": [
-            {"sym": c["sym"], "score": c["score"], "score_100": c.get("score_100", 0), "dir": c["dir"], "rank": i + 1}
-            for i, c in enumerate(channel_a)
-        ],
-        "channel_b": [
-            {"sym": c["sym"], "score": c["score"], "score_100": c.get("score_100", 0), "dir": c["dir"], "rank": i + 1}
-            for i, c in enumerate(channel_b)
-        ],
-    }
-    candidate_snapshots.append(snapshot)
-    while len(candidate_snapshots) > SNAPSHOT_SIZE:
-        candidate_snapshots.pop(0)
-    return snapshot
-
-def analyze_rank_changes(snapshots):
-    """对比5个快照中每个品种的排名变化，找出急速上升/下降/新星"""
-    if len(snapshots) < SNAPSHOT_SIZE:
-        return []
-
-    analysis = []
-    latest = snapshots[-1]
-
-    for channel_key in ("channel_a", "channel_b"):
-        ch_label = "A" if channel_key == "channel_a" else "B"
-        latest_queue = latest[channel_key]
-
-        for item in latest_queue:
-            sym = item["sym"]
-            current_rank = item["rank"]
-            current_score = item["score"]
-
-            # 回溯前4个快照中的排名和评分
-            rank_history = []
-            score_history = []
-
-            for snap in snapshots:
-                found = False
-                for q_item in snap[channel_key]:
-                    if q_item["sym"] == sym:
-                        rank_history.append(q_item["rank"])
-                        score_history.append(q_item["score"])
-                        found = True
-                        break
-                if not found:
-                    rank_history.append(200)  # 不在队列中=排名200
-                    score_history.append(0)
-
-            # 排名变化：正数=上升
-            old_rank = rank_history[0]
-            new_rank = rank_history[-1]
-            rank_delta = old_rank - new_rank
-
-            # 评分变化
-            old_score = score_history[0]
-            new_score = score_history[-1]
-            score_delta = new_score - old_score
-
-            # 连续上升快照数
-            consecutive_rise = 0
-            for i in range(len(rank_history) - 1, 0, -1):
-                if rank_history[i] < rank_history[i - 1]:  # 排名数字变小=上升
-                    consecutive_rise += 1
-                else:
-                    break
-
-            # 信号类型判定
-            signal_type = "STABLE"
-            if old_rank == 200 and current_rank <= 10:
-                signal_type = "NEW_STAR"  # 新星入场
-            elif rank_delta >= RANK_DELTA_THRESHOLD and score_delta > 0:
-                signal_type = "RISING"    # 急速上升
-            elif rank_delta <= -RANK_DELTA_THRESHOLD:
-                signal_type = "FALLING"   # 急速下降
-
-            analysis.append({
-                "sym": sym,
-                "channel": ch_label,
-                "dir": item["dir"],
-                "rank_history": rank_history,
-                "score_history": score_history,
-                "rank_delta": rank_delta,
-                "score_delta": score_delta,
-                "consecutive_rise": consecutive_rise,
-                "signal_type": signal_type,
-            })
-
-    return analysis
-
-def select_rising_candidates(analysis, occupied_syms):
-    """从分析结果中筛选急速上升候选（排除已有持仓+冷却中的品种）"""
-    now = time.time()
-    rising = [
-        a for a in analysis
-        if a["signal_type"] in ("RISING", "NEW_STAR")
-        and a["sym"] not in occupied_syms
-        and a["score_delta"] > 0
-    ]
-    # 按rank_delta降序
-    rising.sort(key=lambda x: x["rank_delta"], reverse=True)
-    return rising[:2]
 
 # ==================== 日志 ====================
 SCRIPT_DIR = os.path.expanduser("~/.hermes/scripts")
@@ -816,17 +704,12 @@ def recalc_position_score(inst_id, pos_info, mt_data_map, fr_map):
     direction = pos_info.get("direction", "?")
     ticker = inst_id.replace("-USDT-SWAP", "")
     
-    # RISING仓位使用source_channel决定评分逻辑
-    effective_channel = channel
-    if channel.startswith("RISING"):
-        effective_channel = pos_info.get("source_channel", "B")
-    
     # 获取当前数据
     mt = mt_data_map.get(inst_id, {})
     fr = fr_map.get(inst_id)
     chain_bonus, chain_tags = get_chain_score(ticker)
     
-    if effective_channel == "A":
+    if channel == "A":
         # 通道A评分 = FR强度 + 持久性 + 链上 + 放量
         if fr is None:
             return pos_info.get("score", 0), chain_tags
@@ -839,7 +722,7 @@ def recalc_position_score(inst_id, pos_info, mt_data_map, fr_map):
             score += 1
         return score, chain_tags
     
-    elif effective_channel == "B":
+    elif channel == "B":
         # 通道B重新计算完整评分
         if "chg_5m" not in mt:
             return pos_info.get("score", 0), chain_tags
@@ -1500,7 +1383,7 @@ def main():
                 log(f"  🔴 通道A: {len(channel_a)}个候选")
                 for c in channel_a[:3]:
                     tags = f"[{','.join(c.get('chain_tags',[]))}]" if c.get("chain_tags") else ""
-                    log(f"    {c['sym']} ↑ FR={c['fr']*100:+.4f}% score={c['score']}({c['score_100']:.0f}/100) {tags}")
+                    log(f"    {c['sym']} {'↑' if c['dir']=='LONG' else '↓'} FR={c['fr']*100:+.4f}% score={c['score']}({c['score_100']:.0f}/100) {tags}")
             if channel_b:
                 log(f"  🔵 通道B: {len(channel_b)}个候选")
                 for c in channel_b[:3]:
@@ -1517,12 +1400,6 @@ def main():
                     positions[inst_id]["score"] = new_score
                     if abs(new_score - old_score) >= 3:
                         log(f"  📊 {inst_id} 评分变化: {old_score}→{new_score} [{','.join(tags)}]")
-
-            # === 2. 快照记录 ===
-            snapshot = take_snapshot(channel_a, channel_b)
-            snap_count = len(candidate_snapshots)
-            if snap_count < SNAPSHOT_SIZE:
-                log(f"  📊 快照队列({snap_count}/{SNAPSHOT_SIZE}): 等待第{SNAPSHOT_SIZE}个快照")
 
             # === 3. 结算检查 ===
             near_settle, settle_secs = is_near_settlement()
