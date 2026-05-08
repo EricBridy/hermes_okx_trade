@@ -66,6 +66,7 @@ CHAIN_CACHE = {
     "smart_money_buy": set(),
     "hot_topics": set(),
     "smart_money_inflow": set(),
+    "token_metrics": {},   # symbol -> {traders24h, trades24h, sm_pct, insider_pct, holders, kol}
     "last_update": 0
 }
 
@@ -251,6 +252,43 @@ def fetch_smart_money_inflow():
             pass
     return result
 
+def fetch_social_metrics():
+    """从Binance Web3 social-rush API提取社交情绪+鲸鱼持仓+集中度数据
+    返回: dict[symbol -> {traders24h, trades24h, sm_pct, insider_pct, holders, kol}]
+    """
+    result = {}
+    for chain_id in ["CT_501", "56"]:
+        try:
+            url = "https://web3.binance.com/bapi/defi/v2/public/wallet-direct/buw/wallet/market/token/social-rush/rank/list/ai"
+            d = curl_json(f"{url}?chainId={chain_id}&rankType=10&sort=20&asc=false", timeout=CHAIN_API_TIMEOUT)
+            if not d.get("data"):
+                continue
+            for topic in d["data"]:
+                for t in topic.get("tokenList", []):
+                    sym = (t.get("symbol") or "").upper()
+                    if not sym:
+                        continue
+                    holders = int(t.get("holders") or 0)
+                    if holders < 50:  # 排除极小代币
+                        continue
+                    # 取最大holders的那个条目（避免重复覆盖小数据）
+                    existing = result.get(sym, {})
+                    if holders > existing.get("holders", 0):
+                        sm_pct = t.get("smartMoneyHoldingPercent")
+                        insider_pct = t.get("insiderHoldingPercent")
+                        result[sym] = {
+                            "traders24h": int(t.get("uniqueTrader24h") or 0),
+                            "trades24h": int(t.get("count24h") or 0),
+                            "sm_pct": float(sm_pct) if sm_pct else 0,
+                            "insider_pct": float(insider_pct) if insider_pct else 0,
+                            "holders": holders,
+                            "kol": int(t.get("kolHolders") or 0),
+                        }
+        except:
+            pass
+    return result
+
+
 def save_chain_cache():
     """持久化链上缓存到磁盘"""
     try:
@@ -258,6 +296,7 @@ def save_chain_cache():
             "smart_money_buy": list(CHAIN_CACHE["smart_money_buy"]),
             "hot_topics": list(CHAIN_CACHE["hot_topics"]),
             "smart_money_inflow": list(CHAIN_CACHE["smart_money_inflow"]),
+            "token_metrics": CHAIN_CACHE["token_metrics"],
             "last_update": CHAIN_CACHE["last_update"]
         }
         with open(CHAIN_CACHE_FILE, "w") as f:
@@ -274,8 +313,10 @@ def load_chain_cache():
             CHAIN_CACHE["smart_money_buy"] = set(data.get("smart_money_buy", []))
             CHAIN_CACHE["hot_topics"] = set(data.get("hot_topics", []))
             CHAIN_CACHE["smart_money_inflow"] = set(data.get("smart_money_inflow", []))
+            CHAIN_CACHE["token_metrics"] = data.get("token_metrics", {})
             age = time.time() - data.get("last_update", 0)
-            log(f"  [chain] 从磁盘恢复缓存: SM={len(CHAIN_CACHE['smart_money_buy'])} HOT={len(CHAIN_CACHE['hot_topics'])} INF={len(CHAIN_CACHE['smart_money_inflow'])} (缓存{int(age)}秒前)")
+            tm_count = len(CHAIN_CACHE["token_metrics"])
+            log(f"  [chain] 从磁盘恢复缓存: SM={len(CHAIN_CACHE['smart_money_buy'])} HOT={len(CHAIN_CACHE['hot_topics'])} INF={len(CHAIN_CACHE['smart_money_inflow'])} metrics={tm_count} (缓存{int(age)}秒前)")
             CHAIN_CACHE["last_update"] = data.get("last_update", 0)
             return True
     except:
@@ -286,28 +327,34 @@ def update_chain_cache():
     now = time.time()
     if now - CHAIN_CACHE["last_update"] < CHAIN_DATA_TTL:
         return
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         f_sm = ex.submit(fetch_smart_money_signals)
         f_ht = ex.submit(fetch_hot_topic_tokens)
         f_in = ex.submit(fetch_smart_money_inflow)
+        f_social = ex.submit(fetch_social_metrics)
         try:
             sm = f_sm.result(timeout=CHAIN_API_TIMEOUT + 2)
             ht = f_ht.result(timeout=CHAIN_API_TIMEOUT + 2)
             inf = f_in.result(timeout=CHAIN_API_TIMEOUT + 2)
+            social = f_social.result(timeout=CHAIN_API_TIMEOUT + 2)
             CHAIN_CACHE["smart_money_buy"] = sm
             CHAIN_CACHE["hot_topics"] = ht
             CHAIN_CACHE["smart_money_inflow"] = inf
+            CHAIN_CACHE["token_metrics"] = social
             CHAIN_CACHE["last_update"] = now
             save_chain_cache()  # 持久化到磁盘
-            log(f"  [chain] SM_buy={len(sm)} topics={len(ht)} SM_inflow={len(inf)}")
+            log(f"  [chain] SM_buy={len(sm)} topics={len(ht)} SM_inflow={len(inf)} social={len(social)}")
         except Exception as e:
             log(f"  [chain] API异常: {e}（保留旧缓存）")
             CHAIN_CACHE["last_update"] = now
 
 def get_chain_score(ticker_symbol):
+    """链上评分：原始3因子 + 新增3因子（社交情绪/鲸鱼持仓/持仓集中度）"""
     score = 0
     tags = []
     sym = ticker_symbol.upper()
+
+    # 原始3因子（各+2分）
     if sym in CHAIN_CACHE["smart_money_buy"]:
         score += CHAIN_BONUS
         tags.append("SM")
@@ -317,6 +364,37 @@ def get_chain_score(ticker_symbol):
     if sym in CHAIN_CACHE["smart_money_inflow"]:
         score += CHAIN_BONUS
         tags.append("INF")
+
+    # 新增3因子
+    metrics = CHAIN_CACHE.get("token_metrics", {}).get(sym)
+    if metrics:
+        # 1. 社交情绪（交易活跃度）— traders24h > 500 → +1，> 2000 → +2
+        traders = metrics.get("traders24h", 0)
+        if traders > 2000:
+            score += 2
+            tags.append(f"社{traders}")
+        elif traders > 500:
+            score += 1
+            tags.append(f"社{traders}")
+
+        # 2. 鲸鱼持仓（smartMoneyHoldingPercent > 3% → +2, > 1% → +1）
+        sm_pct = metrics.get("sm_pct", 0)
+        if sm_pct > 3:
+            score += 2
+            tags.append(f"鲸{sm_pct:.1f}%")
+        elif sm_pct > 1:
+            score += 1
+            tags.append(f"鲸{sm_pct:.1f}%")
+
+        # 3. 持仓集中度（insiderHoldingPercent > 5% → +2, > 2% → +1）
+        insider_pct = metrics.get("insider_pct", 0)
+        if insider_pct > 5:
+            score += 2
+            tags.append(f"集{insider_pct:.1f}%")
+        elif insider_pct > 2:
+            score += 1
+            tags.append(f"集{insider_pct:.1f}%")
+
     return score, tags
 
 
@@ -503,7 +581,7 @@ def get_multi_timeframe(sym):
         return {}
 
 def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_15m=None, chg_5m_dir=None, mt_data=None):
-    """通道B综合评分（满分16）"""
+    """通道B综合评分（满分23，含6个链上因子）"""
     score = 0
 
     # 0. 15m趋势一致性检查（一票否决）
@@ -1209,8 +1287,8 @@ def main():
                 unified_queue.append(c)
 
             for c in channel_b:
-                # 通道B: score范围0-16，归一化到0-100
-                score_100 = min(c["score"] / 16.0 * 100, 100)
+                # 通道B: score范围0-23(含6个链上因子)，归一化到0-100
+                score_100 = min(c["score"] / 23.0 * 100, 100)
                 c["score_100"] = score_100
                 unified_queue.append(c)
 
@@ -1259,7 +1337,7 @@ def main():
                 if pinfo.get("channel") == "A":
                     pos_scores_100[pid] = min(pinfo.get("score", 0) / 10.0 * 100, 100)
                 else:
-                    pos_scores_100[pid] = min(pinfo.get("score", 0) / 16.0 * 100, 100)
+                    pos_scores_100[pid] = min(pinfo.get("score", 0) / 23.0 * 100, 100)
 
             # Top N候选
             top_candidates = cooled[:MAX_CONCURRENT]
