@@ -35,13 +35,13 @@ SLOT_3_4_PCT = 0.50       # 仓位3/4各占剩余资金50%
 FR_EXTREME_THRESHOLD = 0.0005   # |FR| > 0.05% 触发通道A
 FR_MAX_THRESHOLD = 0.01         # |FR| > 1% 跳过（陷阱）
 CHANNEL_A_VOL_SPIKE = 1.3       # 放量阈值
-CHANNEL_A_POSITION_PCT = 0.90   # 仓位90%
+CHANNEL_A_POSITION_PCT = 0.40   # 仓位1占总资金40%
 # 复盘验证: FR<0做多赚钱，FR>0做空亏钱 → 通道A只做多
 CHANNEL_A_DIRECTION = "LONG"    # 只做多(FR<0)
 
 # 通道B: 动量顺势
 MOMENTUM_SCORE_THRESHOLD = 5    # 综合评分≥5触发通道B
-CHANNEL_B_POSITION_PCT = 0.60   # 仓位60%
+CHANNEL_B_POSITION_PCT = 0.30   # 仓位2占总资金30%
 # 方向: 顺势（涨做多，跌做空）
 
 # 共用
@@ -768,7 +768,7 @@ def calculate_momentum_score(chg_5m, vol_1m, ups, downs, chain_bonus, fr, trend_
     elif ups > 10 or downs > 10:
         score += 1
 
-    # 4. 链上信号 (0-4分)
+    # 4. 链上信号 (0-11分，含6维度)
     score += chain_bonus
 
     # 5. FR方向一致 (+1分)
@@ -848,7 +848,7 @@ def scan_dual_channel():
     # 1. 获取所有USDT-SWAP行情
     d = curl_json("https://www.okx.com/api/v5/market/tickers?instType=SWAP", 15)
     if not d.get("data"):
-        return [], []
+        return [], [], {}, {}
 
     usdt = []
     for x in d["data"]:
@@ -1244,7 +1244,15 @@ def main():
                 algo_map[aid_inst] = []
             algo_map[aid_inst].append(a["algoId"])
 
-    existing = get_all_positions()
+    # 重启前先查FR数据，用于判断恢复持仓的通道来源
+    # 这样可以正确分配channel而不是用"?"
+    _restore_fr_map = {}
+    _restore_existing = get_all_positions()
+    if _restore_existing:
+        _restore_syms = [p["instId"] for p in _restore_existing]
+        _restore_fr_map = get_funding_rates_batch(_restore_syms)
+
+    existing = _restore_existing
     protected_inst_ids = set()
     if existing:
         for p in existing:
@@ -1256,17 +1264,42 @@ def main():
             specs = INSTRUMENTS_CACHE.get(inst_id, {})
             notional = abs(pos_val) * specs.get("ctVal", 1) * entry_price
             matched_algos = algo_map.get(inst_id, [])
+            # 通过FR判断恢复持仓的通道来源
+            restored_fr = _restore_fr_map.get(inst_id)
+            restored_channel = "?"
+            if restored_fr is not None:
+                if abs(restored_fr) >= FR_EXTREME_THRESHOLD and restored_fr < 0:
+                    restored_channel = "A"  # FR极端负 → 通道A
+                else:
+                    restored_channel = "B"  # 其他 → 通道B
             positions[inst_id] = {
                 "instId": inst_id, "direction": direction,
                 "entry_price": entry_price, "sz": int(abs(pos_val)),
                 "algo_ids": matched_algos, "open_time": time.time(),
                 "notional": notional, "trail_activated": False,
-                "highest_pnl_pct": 0, "fr": 0,
-                "last_upl": float(p.get("upl", 0)), "channel": "?"
+                "highest_pnl_pct": 0, "fr": restored_fr or 0,
+                "last_upl": float(p.get("upl", 0)), "channel": restored_channel
             }
             algo_status = f" algo={len(matched_algos)}" if matched_algos else " ⚠️无挂单"
             log(f"  📥 {inst_id} {direction} {int(abs(pos_val))}张 @ ${entry_price}{algo_status}")
         log(f"  共加载 {len(existing)} 个持仓")
+
+    # 清理重复通道分配（重启时可能2个持仓都被分配为channel="A"）
+    channel_counts = {}
+    for pid, pinfo in positions.items():
+        ch = pinfo.get("channel", "?")
+        if ch not in channel_counts:
+            channel_counts[ch] = []
+        channel_counts[ch].append(pid)
+    for ch, pids in channel_counts.items():
+        if ch in ("A", "B") and len(pids) > 1:
+            # 保留第一个，关闭多余的
+            for extra_pid in pids[1:]:
+                log(f"  ⚠️ 通道{ch}重复: {extra_pid} → 关闭多余持仓")
+                close_position(extra_pid, positions[extra_pid].get("algo_ids"))
+                with positions_lock:
+                    if extra_pid in positions:
+                        del positions[extra_pid]
     else:
         log("  无持仓")
 
@@ -1436,12 +1469,6 @@ def main():
                 last = state.get("last_trade", {}).get(sym, 0)
                 return now_ts - last >= COOLDOWN_SEC
 
-            # 获取已有持仓的通道和符号
-            pos_by_channel = {}  # "A" -> inst_id, "B" -> inst_id, "SLOT3" -> inst_id, "SLOT4" -> inst_id
-            for pid, pinfo in positions.items():
-                ch = pinfo.get("channel", "?")
-                pos_by_channel[ch] = pid
-
             # ============================================================
             # 仓位1管理: 通道A独占
             # ============================================================
@@ -1498,7 +1525,7 @@ def main():
                             top_a = c
                             break
                     if top_a:
-                        per_slot = balance * 0.40
+                        per_slot = balance * CHANNEL_A_POSITION_PCT
                         log(f"🔥 [仓位1] {top_a['sym']} {top_a['dir']} FR={top_a['fr']*100:+.4f}% score={top_a['score']} 仓位${per_slot:.2f}")
                         pos = open_position(top_a["sym"], top_a["dir"], per_slot, "A")
                         if pos:
@@ -1562,7 +1589,7 @@ def main():
                             top_b = c
                             break
                     if top_b:
-                        per_slot = balance * 0.30
+                        per_slot = balance * CHANNEL_B_POSITION_PCT
                         log(f"🔥 [仓位2] {top_b['sym']} {top_b['dir']} score={top_b['score']} 仓位${per_slot:.2f}")
                         pos = open_position(top_b["sym"], top_b["dir"], per_slot, "B")
                         if pos:
