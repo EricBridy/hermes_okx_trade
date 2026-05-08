@@ -19,19 +19,20 @@ TP_PCT = 0.03          # 3% 止盈（妖币行情大）
 SL_PCT = 0.015         # 1.5% 止损
 TRAIL_ACTIVATE = 0.015  # 浮盈1.5%后启动追踪止损
 TRAIL_DISTANCE = 0.008  # 追踪止损距离0.8%
-TIME_STOP_SEC = 600     # 10分钟时间止损（妖币行情需要更多时间）
-SCAN_INTERVAL = 20      # 20秒扫描一次
-COOLDOWN_SEC = 600      # 同一品种冷却10分钟
-MAX_CONCURRENT = 2      # 最多同时持仓2个
+TIME_STOP_SEC = 900     # 15分钟时间止损
+SCAN_INTERVAL = 30      # 30秒扫描一次（减少噪音交易）
+COOLDOWN_SEC = 1200     # 同一品种冷却20分钟（减少过度交易）
+MAX_CONCURRENT = 1      # 最多同时持仓1个（降低多仓爆亏风险）
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_PAUSE_SEC = 1800
 
 # 妖币筛选阈值
-FUNDING_RATE_EXTREME = 0.0003   # |费率| > 0.03% 视为极端
+FUNDING_RATE_EXTREME = 0.001    # |费率| > 0.1% 视为极端（复盘验证：<0.1%品种全亏）
 FUNDING_RATE_ULTRA = 0.001      # |费率| > 0.1% 视为超级极端（重仓）
-ULTRA_POSITION_MULT = 1.5       # 超级极端费率仓位倍数
-VOLUME_SPIKE_RATIO = 1.3        # 成交量 > 均量130% 视为放量
-MIN_24H_VOL = 1000000           # 最小24h成交量 $100万
+NORMAL_POSITION_PCT = 0.60      # 普通信号使用60%余额
+ULTRA_POSITION_PCT = 0.95       # 超级极端信号使用95%余额
+VOLUME_SPIKE_RATIO = 1.5        # 成交量 > 均量150% 视为放量（更严格确认）
+MIN_24H_VOL = 5000000           # 最小24h成交量 $500万（排除流动性差的小品种）
 MIN_PRICE = 0.001               # 最低价格
 MAX_FUNDING_RATE = 0.01         # |费率| > 1% 跳过（太极端可能有陷阱）
 OKX_TAKER_FEE = 0.0005          # 0.05% taker fee per side
@@ -907,14 +908,14 @@ def main():
                         n_open = min(len(cooled), slots)
                         # 修正：只除以新开仓数（已有仓位的保证金已被占用，availBal已扣除）
                         # 留5%缓冲防手续费/精度导致的余额不足
-                        base_slot = balance * 0.95 / max(n_open, 1)
-                        if base_slot >= 1:
+                        if balance >= 1:
                             for cand in cooled[:n_open]:
-                                # 费率分层：超级极端(>0.1%)给予1.5倍仓位
-                                per_slot = base_slot
+                                # 费率分层：普通60%仓位，超级极端95%仓位
                                 if cand["abs_fr"] >= FUNDING_RATE_ULTRA:
-                                    per_slot = min(base_slot * ULTRA_POSITION_MULT, balance * 0.95)
-                                    log(f"  💎 {cand['sym']} 超级极端费率{cand['fr']*100:+.4f}% → 1.5倍仓位${per_slot:.2f}")
+                                    per_slot = balance * ULTRA_POSITION_PCT
+                                    log(f"  💎 {cand['sym']} 超级极端费率{cand['fr']*100:+.4f}% → 95%仓位${per_slot:.2f}")
+                                else:
+                                    per_slot = balance * NORMAL_POSITION_PCT
                                 log(f"🔥 妖币开仓: {cand['sym']} {cand['dir']} FR={cand['fr']*100:+.4f}% vol={cand['vol_ratio']:.1f}x")
                                 pos = open_position(cand["sym"], cand["dir"], per_slot)
                                 if pos:
