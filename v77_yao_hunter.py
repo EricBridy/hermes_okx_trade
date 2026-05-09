@@ -868,8 +868,8 @@ def scan_dual_channel():
                     chg_5m_a = mt.get("chg_5m", 0)
                     trend_15m_a = mt.get("trend_15m", "FLAT")
                     rsi_a = mt.get("rsi_14", 50)
-                    adx_a = mt.get("adx_14", 50)
-                    bb_a = mt.get("bb_width", 5)
+                    adx_a = mt.get("adx_14", 25)  # 无数据时默认25，不触发>=40过滤
+                    bb_a = mt.get("bb_width", 3.0)  # 无数据时默认3%，不触发<1.5%过滤
                     
                     # v7.7: ADX过滤 — 趋势过强做空危险
                     if adx_a >= 40:
@@ -944,11 +944,11 @@ def scan_dual_channel():
                     if not safe:
                         continue
                 # v7.7: ADX过滤 — 趋势过强做空危险
-                adx_b = mt.get("adx_14", 50)
+                adx_b = mt.get("adx_14", 25)  # 无数据时默认25，不触发>=40过滤
                 if adx_b >= 40:
                     continue
                 # v7.7: BB宽度过滤 — 太窄无空间
-                bb_b = mt.get("bb_width", 5)
+                bb_b = mt.get("bb_width", 3.0)  # 无数据时默认3%，不触发<1.5%过滤
                 if bb_b < 1.5:
                     continue
                 # v7.7: ROC确认方向（做空需已在跌，做多需已在涨）
