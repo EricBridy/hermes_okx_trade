@@ -1417,6 +1417,15 @@ def main():
             # ============================================================
             # 仓位1管理: 通道A独占
             # ============================================================
+            # 暂停检查（防止连亏暂停后仍开仓）
+            if state.get("pause_until"):
+                pause_until = datetime.fromisoformat(state["pause_until"])
+                if datetime.now() < pause_until:
+                    remaining = int((pause_until - datetime.now()).total_seconds())
+                    log(f"⏸️ 连亏暂停中，剩余{remaining}秒")
+                    time.sleep(60)
+                    continue
+
             slot1_id = None
             for pid, pinfo in positions.items():
                 if pinfo.get("channel") == "A":
@@ -1466,7 +1475,7 @@ def main():
                         slot1_id = None
                         save_state(state)
             else:
-                # 仓位1空着，开通道A Top1
+                # 仓位1空着，开通道A Top1（暂停检查在上方，此处无需重复）
                 if channel_a and balance >= 1:
                     top_a = None
                     for c in channel_a:
@@ -1495,10 +1504,19 @@ def main():
                     break
 
             if slot2_id:
-                # 检查换仓条件: 方向反转或（评分归零+价格跌破开仓价）（方案4改进）
+                # 检查换仓条件: 方向反转或（评分归零+价格跌破开仓价或持续2分钟）（BUG#2修复）
                 pos_info = positions[slot2_id]
                 pos_score = pos_info.get("score", 0)
                 need_swap_b = False
+
+                # 评分归零时间追踪
+                if pos_score == 0:
+                    if "score_zero_since" not in pos_info:
+                        pos_info["score_zero_since"] = now_ts
+                    score_zero_elapsed = now_ts - pos_info["score_zero_since"]
+                else:
+                    pos_info.pop("score_zero_since", None)
+                    score_zero_elapsed = 0
 
                 # 获取当前价格判断是否价格也反了
                 _d2 = curl_json(f"https://www.okx.com/api/v5/market/ticker?instId={slot2_id}", 5)
@@ -1511,6 +1529,9 @@ def main():
 
                 if pos_score == 0 and _px_adverse:
                     log(f"  🔄 [仓位2] {slot2_id} 评分归零+价格反向 → 需要换仓")
+                    need_swap_b = True
+                elif pos_score == 0 and score_zero_elapsed > 120:
+                    log(f"  🔄 [仓位2] {slot2_id} 评分归零持续{int(score_zero_elapsed)}秒>2分钟 → 强制换仓")
                     need_swap_b = True
                 elif pos_info.get("direction") == "LONG":
                     chg = mt_data_map.get(slot2_id, {}).get("chg_5m", 0)
