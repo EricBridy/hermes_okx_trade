@@ -80,9 +80,9 @@ prev_channel_b = []       # 上一轮扫描的通道B候选（用于持久性检
 
 # ==================== 日志 ====================
 SCRIPT_DIR = os.path.expanduser("~/.hermes/scripts")
-STATE_FILE = os.path.join(SCRIPT_DIR, "v75_state.json")
-LOG_FILE = os.path.join(SCRIPT_DIR, "v75_trades.log")
-CHAIN_CACHE_FILE = os.path.join(SCRIPT_DIR, "v75_chain_cache.json")
+STATE_FILE = os.path.join(SCRIPT_DIR, "v76_state.json")
+LOG_FILE = os.path.join(SCRIPT_DIR, "v76_trades.log")
+CHAIN_CACHE_FILE = os.path.join(SCRIPT_DIR, "v76_chain_cache.json")
 
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")

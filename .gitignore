@@ -20,3 +20,8 @@ v6_trades.log
 v6_state.json
 v6_chain_cache.json
 v6_trades.log
+
+# runtime files
+v7*_state.json
+v7*_trades.log
+v7*_chain_cache.json

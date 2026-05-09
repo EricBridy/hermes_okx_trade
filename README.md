@@ -191,10 +191,10 @@ CHAIN_API_TIMEOUT = 3           # 链上API超时 3秒
 
 | 文件 | 说明 |
 |------|------|
-| `v75_yao_hunter.py` | v7.5 主程序 — 4仓位独立管理+急速上升检测 |
-| `v75_state.json` | 运行状态（连亏计数、冷却记录） |
-| `v75_trades.log` | 交易日志 |
-| `v75_chain_cache.json` | 链上数据缓存（持久化到磁盘） |
+| `v76_yao_hunter.py` | v7.6 主程序 — 2仓位+多空兼顾+硬性过滤+降噪 |
+| `v76_state.json` | 运行状态（连亏计数、冷却记录） |
+| `v76_trades.log` | 交易日志 |
+| `v76_chain_cache.json` | 链上数据缓存（持久化到磁盘） |
 
 ## 运行环境
 
@@ -219,18 +219,18 @@ passphrase = "YOUR_PASSPHRASE"
 ### 2. 运行
 
 ```bash
-python3 v75_yao_hunter.py
+python3 v76_yao_hunter.py
 ```
 
 ### 3. 查看日志
 
 ```bash
-tail -f ~/.hermes/scripts/v75_trades.log
+tail -f ~/.hermes/scripts/v76_trades.log
 ```
 
 ### 4. 停止
 
-发送 Ctrl+C 或 `pkill -f v75_yao_hunter`
+发送 Ctrl+C 或 `pkill -f v76_yao_hunter`
 
 ---
 
