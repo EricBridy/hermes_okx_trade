@@ -76,6 +76,7 @@ CHAIN_CACHE = {
 positions = {}
 positions_lock = threading.Lock()
 swap_cooldown_map = {}    # 仓位 -> 最后一次换仓时间
+prev_channel_b = []       # 上一轮扫描的通道B候选（用于持久性检查）
 
 # ==================== 日志 ====================
 SCRIPT_DIR = os.path.expanduser("~/.hermes/scripts")
@@ -874,6 +875,12 @@ def scan_dual_channel():
                     safe, reason = check_short_safety(mt)
                     if not safe:
                         continue
+                # 15m趋势必须与开仓方向一致（降噪：避免小周期假突破）
+                if trend_15m:
+                    if direction == "LONG" and trend_15m != "UP":
+                        continue
+                    if direction == "SHORT" and trend_15m != "DOWN":
+                        continue
                 channel_b_candidates.append({
                     "sym": sym,
                     "dir": direction,
@@ -1560,11 +1567,16 @@ def main():
                         slot2_id = None
                         save_state(state)
             else:
-                # 仓位2空着，开通道B Top1
+                # 仓位2空着，开通道B Top1（需连续2轮score≥8才开仓）
                 if channel_b and balance >= 1:
                     top_b = None
                     for c in channel_b:
                         if is_cooled(c["sym"]) and c["sym"] not in positions:
+                            # 持久性检查：该品种在上一轮扫描中也必须score≥8
+                            prev_match = [p for p in prev_channel_b if p["sym"] == c["sym"] and p["score"] >= MOMENTUM_SCORE_THRESHOLD]
+                            if not prev_match:
+                                log(f"  ⏳ [仓位2] {c['sym']} score={c['score']} 但上轮不在候选 → 等持久确认")
+                                continue
                             top_b = c
                             break
                     if top_b:
@@ -1586,6 +1598,9 @@ def main():
                     src = pinfo.get("source_channel", "")
                     src_str = f"(来自{src})" if src else ""
                     log(f"  💼 [{ch}] {pid} {pinfo.get('direction','?')} score={sc}{src_str}")
+
+            # 保存本轮通道B候选供下轮持久性检查
+            prev_channel_b = channel_b[:]
 
             time.sleep(SCAN_INTERVAL)
 
