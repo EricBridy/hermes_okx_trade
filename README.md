@@ -1,283 +1,540 @@
-# hermes_okx_trade
+# OKX Perpetual Swap Backtester
 
-OKX 永续合约自动化交易系统
-
-## 当前版本：v7.5 — 4仓位独立管理 + 急速上升检测
-
-基于 **4仓位独立管理 + 候选快照队列 + 排名速度检测** 的智能交易系统，针对 OKX USDT-SWAP 永续合约市场。
-
-## 核心架构
+**通用 OKX 永续合约回测框架** — 不绑定特定策略版本，支持任意品种、多时间框架、资金费率、手续费、止盈止损、追踪止损。
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    数据采集层                                  │
-│  OKX行情(80品种) + 资金费率(80) + K线(1m/5m/15m)              │
-│  Binance Web3链上数据(6维度，60秒刷新)                         │
-└───────────────┬─────────────────────────┬───────────────────┘
-                │                         │
-    ┌───────────▼───────────┐   ┌────────▼────────────┐
-    │   通道A候选队列       │   │   通道B候选队列      │
-    │   (FR<0,只做多)       │   │   (评分≥5,顺势)      │
-    │   排序: score降序     │   │   排序: score降序    │
-    └───────────┬───────────┘   └────────┬────────────┘
-                │                         │
-    ┌───────────▼─────────────────────────▼────────────┐
-    │              5个缓存快照队列 (每30秒)               │
-    │   snapshot[0] = 2.5分钟前的完整队列快照            │
-    │   ...                                            │
-    │   snapshot[4] = 当前完整队列快照                   │
-    │   → 排名变化分析 → 急速上升/新星入场               │
-    └────────────────────────┬──────────────────────────┘
-                             │
-    ┌────────────────────────▼──────────────────────────┐
-    │              4个独立仓位                            │
-    │   仓位1: 通道A独占(FR反向) — 40%资金               │
-    │   仓位2: 通道B独占(动量顺势) — 30%资金             │
-    │   仓位3: 急速上升候选 — 剩余50%                    │
-    │   仓位4: 急速上升候选 — 剩余50%                    │
-    └────────────────────────────────────────────────────┘
+📊 311+ 合约支持  |  📈 4种内置策略  |  🔧 自定义策略  |  💰 真实费率模拟
 ```
 
-## 核心特性
+---
 
-- **4仓位独立管理**：通道A/B各有独占仓位，不互相干扰
-- **候选快照队列**：每30秒保存完整候选队列，5个快照=2.5分钟趋势窗口
-- **急速上升检测**：5个快照排名上升≥15位或新星入场 → 开仓
-- **保守换仓策略**：只在"开仓理由消失"时换仓（FR消失/方向反转/评分归零）
-- **30分钟换仓冷却**：防止频繁换仓磨手续费
-- **8重噪音过滤**：一票否决机制（RSI/1m反转/动量衰减/量价背离等）
-- **持仓动态评分**：每30秒重评持仓score，信号失效→评分归零
-- **链上6维度数据**：聪明钱/热门话题/资金流入/社交情绪/鲸鱼持仓/持仓集中度
-- **追踪止损+紧急止盈+时间止损+裸仓保护+连亏暂停**
+## 目录
 
-## 策略逻辑
+- [环境要求](#环境要求)
+- [快速开始](#快速开始)
+- [命令详解](#命令详解)
+- [内置策略](#内置策略)
+- [自定义策略](#自定义策略)
+- [回测参数配置](#回测参数配置)
+- [数据说明](#数据说明)
+- [输出说明](#输出说明)
+- [项目结构](#项目结构)
+- [常见问题](#常见问题)
 
-### 通道A：极端FR反向（仓位1独占）
+---
 
-| 条件 | 阈值 | 说明 |
-|------|------|------|
-| 资金费率 | 0.05% < \|FR\| < 1% | 极端费率 = 散户集中方向 |
-| 方向 | 只做FR<0做多 | 复盘：FR<0做多赚$7.66，FR>0做空全亏 |
-| 放量 | > 均量130% | 确认主力行动 |
-| 仓位 | 40%资金 | 仓位1独占 |
+## 环境要求
 
-**换仓条件**：FR消失（|FR|<0.05%）或 FR变正 → 换仓。其他任何情况不换。
-
-### 通道B：动量顺势评分（仓位2独占）
-
-| 评分要素 | 分值 | 说明 |
-|----------|------|------|
-| 5m涨跌幅度 | 1-3分 | >0.5%=1, >1%=2, >2%=3 |
-| 1m放量倍数 | 1-3分 | >1.5x=1, >2x=2, >3x=3 |
-| 1m趋势一致性 | 1-2分 | 连涨/跌>10根=1, >12根=2 |
-| 链上信号 | 0-11分 | 6维度（见下方） |
-| FR方向一致 | +1分 | FR与趋势同向 |
-| 15m趋势强度 | +1分 | 5m和15m同向 |
-| 5m连续确认 | +1分 | 最近2根5m同向且幅度>0.2% |
-
-- **触发**：综合评分 ≥ 5（满分22）
-- **方向**：顺势（涨做多，跌做空）
-- **仓位**：30%资金，仓位2独占
-
-**换仓条件**：方向反转（做多但5m转跌/做空但5m转涨）或评分归零 → 换仓。
-
-### 8重噪音过滤（一票否决）
-
-| # | 过滤器 | 否决场景 |
-|---|--------|----------|
-| 1 | 15m趋势冲突 | 5m涨但15m跌 → 不做多 |
-| 2 | RSI>70超买 | 超买区做多 → 否决 |
-| 3 | RSI<30超卖 | 超卖区做空 → 否决 |
-| 4 | 1m反转检测 | 做多时3根1m全阴 → 正在反转 |
-| 5 | 动量衰减 | 3根5m涨跌幅递减 → 势头已消 |
-| 6 | 量价背离(顶) | 做多时价涨量缩 → 假突破 |
-| 7 | 量价背离(底) | 做空时价跌量缩 → 假跌破 |
-| 8 | 方向反转(持仓) | 持仓5m已转跌/转涨 → 评分归零 |
-
-### 链上6维度数据（Binance Web3 API）
-
-| # | 因子 | 条件 | 分值 |
-|---|------|------|------|
-| 1 | 聪明钱买 | smartMoneyCount≥2 → +2 | +2 |
-| 2 | 热门话题 | 热门话题前5代币 → +2 | +2 |
-| 3 | 资金流入 | 4h净流入前20 → +2 | +2 |
-| 4 | 社交情绪 | traders24h>2000 → +2, >500 → +1 | +1~2 |
-| 5 | 鲸鱼持仓 | sm_pct>3% → +2, >1% → +1 | +1~2 |
-| 6 | 持仓集中度⚠️ | insider>5% → **-2**, >2% → **-1**, <0.5% → +1 | -2~+1 |
-
-### 急速上升检测（仓位3/4）
-
-```
-每30秒记录通道A+B的完整候选队列快照
-5个快照 = 2.5分钟窗口
-对比每个品种在5个快照中的排名变化
-
-急速上升判定：
-  1. 排名上升≥15位 + 评分也在涨 → RISING
-  2. 不在前4个快照中，但突然进入Top10 → NEW_STAR
-
-开仓：急速上升Top2 → 仓位3/4
-换仓：同对应通道的保守换仓条件（FR消失/方向反转/评分归零）
-清空：开仓后清空快照队列，保留最后一个作为新起点
-```
-
-### 持仓管理
-
-| 机制 | 阈值 | 说明 |
-|------|------|------|
-| TP | 3% | OKX algo单自动触发 |
-| SL | 1.5% | OKX algo单自动触发 |
-| 追踪止损 | 浮盈≥1.5%激活，回撤0.8%触发 | 程序主动平仓 |
-| 紧急止盈 | 浮盈≥6% | 程序主动平仓 |
-| 时间止损 | 15分钟且浮盈<0.3% | 程序主动平仓 |
-| 裸仓保护 | 持仓无TP/SL挂单 | 立即强制平仓 |
-| 连亏暂停 | 连续亏3单 | 暂停30分钟 |
-| 换仓冷却 | 30分钟 | 防止频繁换仓 |
-| 品种冷却 | 20分钟 | 同一品种不重复 |
-
-### 换仓原则（v7.5核心改动）
-
-```
-❌ 不换仓：候选评分比持仓高
-✅ 只换仓：持仓的开仓理由已经不存在了
-
-通道A：FR消失或变正 → 换仓
-通道B：方向反转或评分归零 → 换仓
-急速上升：同对应通道条件
-换仓冷却：30分钟内不重复换仓
-```
-
-## 参数配置
-
-```
-# 基础
-LEVERAGE = 6
-TP_PCT = 0.03               # 止盈 3%
-SL_PCT = 0.015              # 止损 1.5%
-TRAIL_ACTIVATE = 0.015      # 追踪止损激活 1.5%
-TRAIL_DISTANCE = 0.008      # 追踪距离 0.8%
-TIME_STOP_SEC = 900         # 时间止损 15分钟
-SCAN_INTERVAL = 30          # 扫描间隔 30秒
-COOLDOWN_SEC = 1200         # 品种冷却 20分钟
-MAX_CONCURRENT = 4          # 4仓位
-SWAP_COOLDOWN = 1800        # 换仓冷却 30分钟
-
-# 急速上升检测
-SNAPSHOT_SIZE = 5           # 缓存快照数量(5×30秒=2.5分钟窗口)
-RANK_DELTA_THRESHOLD = 15   # 排名变化阈值(上升15位以上才开仓)
-SLOT_3_4_PCT = 0.50         # 仓位3/4各占剩余资金50%
-
-# 通道A
-FR_EXTREME_THRESHOLD = 0.0005   # |FR| > 0.05%
-FR_MAX_THRESHOLD = 0.01         # |FR| > 1% 跳过
-CHANNEL_A_VOL_SPIKE = 1.3       # 放量 1.3x
-
-# 通道B
-MOMENTUM_SCORE_THRESHOLD = 5    # 评分 ≥ 5
-
-# 仓位分配
-# 仓位1(通道A): 40%
-# 仓位2(通道B): 30%
-# 仓位3(急升): 剩余50%
-# 仓位4(急升): 剩余50%
-
-# 共用
-MIN_24H_VOL = 2000000           # 最小24h成交量 $200万
-CHAIN_DATA_TTL = 60             # 链上数据刷新 60秒
-CHAIN_API_TIMEOUT = 3           # 链上API超时 3秒
-```
-
-## 文件说明
-
-| 文件 | 说明 |
+| 项目 | 要求 |
 |------|------|
-| `v77_yao_hunter.py` | v7.7 主程序 — ADX/BB/ROC过滤 |
-| `v76_yao_hunter.py` | v7.6 主程序 |
-| `okx_backtest.py` | 通用回测框架 (backtest分支) |
-| `backtest_data/` | 回测数据缓存 |
-| `backtest_reports/` | 回测报告输出 |
+| Python | 3.8+ |
+| 依赖 | **无第三方依赖**（纯标准库） |
+| 网络 | 需要访问 `www.okx.com`（用于下载历史数据） |
+| 磁盘 | 每品种每天约 5-10MB 缓存数据 |
 
-## 运行环境
+```bash
+# 确认 Python 版本
+python3 --version
 
-- **Python 3.8+**
-- **依赖**：纯标准库（回测框架无第三方依赖）
-- **交易所**：OKX（需 API Key + Secret + Passphrase）
-- **服务器**：轻量级，2 核 2G 即可
+# 无需 pip install，开箱即用
+```
+
+---
 
 ## 快速开始
 
-### 1. 配置 OKX API
-
-创建 `~/.okx/config.toml`：
-
-```toml
-[default]
-api_key = "YOUR_API_KEY"
-secret_key = "YOUR_SECRET_KEY"
-passphrase = "YOUR_PASSPHRASE"
-```
-
-### 2. 运行
+### 第 1 步：克隆 backtest 分支
 
 ```bash
-python3 v76_yao_hunter.py
+git clone -b backtest https://github.com/EricBridy/hermes_okx_trade.git
+cd hermes_okx_trade
 ```
 
-### 3. 查看日志
+### 第 2 步：列出所有可用合约
 
 ```bash
-tail -f ~/.hermes/scripts/v76_trades.log
+python3 okx_backtest.py list
 ```
 
-### 4. 停止
+输出示例：
+```
+📋 所有 USDT-SWAP 合约: 311 个
 
-发送 Ctrl+C 或 `pkill -f v76_yao_hunter`
+品种                         24h成交额           价格
+-------------------------------------------------------
+BTC-USDT-SWAP         $45,230,000,000    80,800.0000
+ETH-USDT-SWAP         $18,650,000,000     3,200.0000
+SOL-USDT-SWAP          $8,120,000,000       180.0000
+```
+
+### 第 3 步：下载历史数据
+
+```bash
+python3 okx_backtest.py download --symbols BTC,ETH,SOL --days 7
+```
+
+### 第 4 步：运行回测
+
+```bash
+python3 okx_backtest.py backtest --strategy dual_channel --symbols BTC,ETH,SOL --days 7
+```
+
+### 第 5 步：查看报告
+
+回测完成后自动生成 HTML 报告到 `backtest_reports/` 目录。
 
 ---
 
-## 更新日志
+## 命令详解
 
-### v7.5（2026-05-08）
+### `list` — 列出可用合约
 
-**4仓位独立管理 + 急速上升检测**
+```bash
+python3 okx_backtest.py list                    # 默认显示 Top 30
+python3 okx_backtest.py list --limit 50         # 显示 Top 50
+python3 okx_backtest.py list --limit 100        # 显示 Top 100
+```
 
-| 改动 | 说明 |
-|------|------|
-| 4仓位独立管理 | 仓位1=A独占，仓位2=B独占，仓位3/4=急速上升 |
-| 候选快照队列 | 每30秒保存完整候选队列，5个快照=2.5分钟趋势窗口 |
-| 排名速度检测 | 5个快照中排名上升≥15位 → 急速上升 → 开仓 |
-| 新星入场检测 | 不在前4个快照中，但突然进入Top10 → 开仓 |
-| 保守换仓策略 | 只在"开仓理由消失"时换仓，不因评分差异换仓 |
-| 30分钟换仓冷却 | 防止频繁换仓磨手续费 |
-| 通道A/B不共用队列 | 通道A有自己的队列，通道B有自己的队列 |
-| 仓位分配 | A=40%，B=30%，急升=50%(剩余) |
+### `download` — 下载历史数据
 
-### v7.0（2026-05-08）
+```bash
+# 下载指定品种
+python3 okx_backtest.py download --symbols BTC,ETH,SOL,DOGE,XRP
 
-候选队列动态管理（已被v7.5取代）
+# 下载 30 天数据
+python3 okx_backtest.py download --symbols BTC,ETH --days 30
 
-- 统一候选队列，归一化0-100分
-- 持仓动态评分，每30秒重评
-- 8重噪音过滤
-- 链上6维度数据
+# 下载所有可用合约（注意：数据量较大）
+python3 okx_backtest.py download --symbols $(python3 okx_backtest.py list --limit 50 | awk 'NR>3{print $1}' | tr '\n' ',') --days 7
+```
 
-### v6.0（2026-05-08）
+参数：
 
-双通道策略（已被v7.0取代）
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--symbols` | BTC,ETH,SOL,DOGE,XRP,PEPE,WIF,AVAX,LINK,BONK | 逗号分隔的品种列表（自动加 `-USDT-SWAP` 后缀） |
+| `--days` | 7 | 下载天数 |
+| `--list` | - | 同时列出所有可用合约 |
 
-### v5.x（2026-05-07 ~ 05-08）
+### `backtest` — 运行回测
 
-v5.2: 参数优化
-v5.1: 链上数据整合 + 追踪止损
-v5.0: 极端FR反向策略
+```bash
+# 基础用法
+python3 okx_backtest.py backtest --strategy momentum --days 7
 
-### v4.x（2026-05-06）
+# 指定品种
+python3 okx_backtest.py backtest --strategy dual_channel --symbols BTC,ETH,SOL --days 14
 
-v4.2: 多仓并行 + EMA/ADX策略
-v4.1: 单仓版本
+# 自定义参数
+python3 okx_backtest.py backtest --strategy momentum --days 7 --balance 100 --leverage 10 --tp 2.0 --sl 1.0
+
+# 使用自定义策略文件
+python3 okx_backtest.py backtest --strategy my_strategy.py --days 7
+```
+
+参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--strategy` | momentum | 策略名或 .py 文件路径 |
+| `--symbols` | 自动选 Top 10 | 逗号分隔品种（空=自动选成交量 Top 10） |
+| `--days` | 7 | 回测天数 |
+| `--balance` | 20.0 | 初始余额 (USDT) |
+| `--leverage` | 6 | 杠杆倍数 |
+| `--tp` | 3.0 | 止盈百分比 |
+| `--sl` | 1.5 | 止损百分比 |
 
 ---
 
-## 风险提示
+## 内置策略
 
-⚠️ 本项目仅供学习和研究目的。加密货币合约交易风险极高，可能导致本金全部损失。使用前请充分了解风险，作者不对任何交易损失负责。
+### 1. `momentum` — 动量顺势
+
+顺势交易：5m 涨做多、跌做空，需要多维度过滤。
+
+```
+开仓条件:
+  - 5m 涨跌幅 > 0.1%
+  - ADX < 40（趋势不过强）
+  - BB 宽度 > 1.5%（有波动空间）
+  - ROC 方向确认
+  - RSI 不在极端区域
+  - 综合评分 ≥ 8
+```
+
+```bash
+python3 okx_backtest.py backtest --strategy momentum --days 7
+```
+
+### 2. `funding_reversal` — 资金费率反转
+
+极端资金费率时反向开仓：FR<0 做多，FR>0 做空。
+
+```
+开仓条件:
+  - |FR| > 0.05% 且 < 5%
+  - 放量 > 1.5x
+  - ADX < 40
+  - BB 宽度 > 1.5%
+  - 技术方向确认
+```
+
+```bash
+python3 okx_backtest.py backtest --strategy funding_reversal --days 7
+```
+
+### 3. `dual_channel` — 双通道组合
+
+同时运行 momentum + funding_reversal，合并信号。
+
+```bash
+python3 okx_backtest.py backtest --strategy dual_channel --days 7
+```
+
+### 策略对比
+
+| 策略 | 类型 | 适合行情 | 信号频率 |
+|------|------|----------|----------|
+| `momentum` | 顺势 | 单边趋势 | 中等 |
+| `funding_reversal` | 逆势 | 极端情绪反转 | 较少 |
+| `dual_channel` | 混合 | 各种行情 | 较多 |
+
+---
+
+## 自定义策略
+
+创建一个 `.py` 文件，继承 `BaseStrategy` 并实现 `on_bar()` 方法。
+
+### 模板
+
+```python
+# my_strategy.py
+from okx_backtest import BaseStrategy, Signal, calc_rsi, calc_adx, calc_bb_width
+
+class Strategy(BaseStrategy):
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.name = "my_custom_strategy"
+
+    def on_bar(self, ctx):
+        """
+        每根 5m K线 触发一次。
+
+        ctx 字典内容:
+          ctx["symbol"]     — 当前品种 (如 "BTC-USDT-SWAP")
+          ctx["bar_index"]  — 当前 K线索引
+          ctx["timestamps"] — 时间戳数组
+          ctx["opens"]      — 开盘价数组
+          ctx["highs"]      — 最高价数组
+          ctx["lows"]       — 最低价数组
+          ctx["closes"]     — 收盘价数组（已排序，最近在末尾）
+          ctx["vols"]       — 成交量数组
+          ctx["funding"]    — 资金费率历史列表
+          ctx["balance"]    — 当前余额
+          ctx["positions"]  — 当前活跃持仓列表
+
+        返回:
+          [] — 无信号
+          [Signal("BTC-USDT-SWAP", "LONG", 10, "RSI超卖反转")]
+          — 开多 BTC，评分10
+
+        注意: 前 50 根 K线是指标预热期，指标数据可能不完整
+        """
+        signals = []
+        c = ctx["closes"]
+
+        # 至少需要 50 根 K线
+        if len(c) < 50:
+            return []
+
+        # 计算指标
+        rsi = calc_rsi(c)
+        adx = calc_adx(ctx["highs"], ctx["lows"], c)
+
+        # 你的策略逻辑
+        if rsi < 30 and adx is not None and adx > 25:
+            signals.append(Signal(
+                ctx["symbol"], "LONG", 10,
+                f"RSI={rsi:.0f} ADX={adx:.0f}"
+            ))
+
+        return signals
+```
+
+### 运行自定义策略
+
+```bash
+python3 okx_backtest.py backtest --strategy my_strategy.py --days 7
+```
+
+### 内置指标函数
+
+| 函数 | 说明 | 参数 |
+|------|------|------|
+| `calc_rsi(closes, period=14)` | RSI 相对强弱 | 收盘价数组 |
+| `calc_adx(highs, lows, closes, period=14)` | ADX 趋势强度 | 高/低/收数组 |
+| `calc_bb_width(closes, period=20)` | 布林带宽度 % | 收盘价数组 |
+| `calc_atr(highs, lows, closes, period=14)` | ATR 真实波幅 | 高/低/收数组 |
+| `calc_stoch_k(highs, lows, closes, period=14)` | 随机指标 K | 高/低/收数组 |
+| `calc_roc(closes, period=10)` | 价格变化率 ROC | 收盘价数组 |
+| `calc_sma(closes, period)` | 简单移动平均 | 收盘价数组 |
+| `calc_ema(closes, period)` | 指数移动平均 | 收盘价数组 |
+| `find_funding_at(funding_list, ts_ms)` | 查找最近资金费率 | 费率列表+时间戳 |
+
+### Signal 对象
+
+```python
+Signal(
+    symbol="BTC-USDT-SWAP",   # 品种 (必须带 -USDT-SWAP)
+    direction="LONG",          # "LONG" 或 "SHORT"
+    score=10,                  # 评分 (越高越优先)
+    reason="RSI超卖反转"       # 原因说明
+)
+```
+
+---
+
+## 回测参数配置
+
+通过 `--balance` / `--leverage` / `--tp` / `--sl` 覆盖默认值：
+
+```bash
+python3 okx_backtest.py backtest --strategy momentum \
+  --balance 100 \       # 100 USDT 初始资金
+  --leverage 10 \       # 10 倍杠杆
+  --tp 2.0 \            # 止盈 2%
+  --sl 1.0              # 止损 1%
+```
+
+### 完整默认参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `initial_balance` | 20.0 | 初始余额 USDT |
+| `leverage` | 6 | 杠杆倍数 |
+| `position_pct` | 0.40 | 每笔仓位占可用资金 40% |
+| `tp_pct` | 0.03 (3%) | 止盈 |
+| `sl_pct` | 0.015 (1.5%) | 止损 |
+| `trail_activate_pct` | 0.015 (1.5%) | 浮盈达到 1.5% 激活追踪止损 |
+| `trail_distance_pct` | 0.008 (0.8%) | 追踪止损距离 0.8% |
+| `time_stop_seconds` | 480 (8min) | 持仓超过 8 分钟触发时间止损 |
+| `taker_fee` | 0.0005 (0.05%) | Taker 手续费（单边） |
+| `maker_fee` | 0.0002 (0.02%) | Maker 手续费（单边） |
+| `max_positions` | 2 | 最大同时持仓数 |
+| `cooldown_seconds` | 2400 (40min) | 同品种平仓后冷却期 |
+| `max_consecutive_loss` | 3 | 连亏 N 笔后暂停交易 |
+
+### 修改方式
+
+在自定义策略文件中覆盖：
+
+```python
+class Strategy(BaseStrategy):
+    def __init__(self, config=None):
+        # 覆盖默认参数
+        custom_config = {
+            "leverage": 10,
+            "tp_pct": 0.02,
+            "sl_pct": 0.01,
+            "max_positions": 3,
+        }
+        super().__init__({**custom_config, **(config or {})})
+        self.name = "aggressive"
+```
+
+---
+
+## 数据说明
+
+### 下载内容
+
+每个品种下载 4 个时间框架 + 资金费率：
+
+| 数据 | OKX API | 说明 |
+|------|---------|------|
+| 1m K线 | `/api/v5/market/history-candles` | 1 分钟 |
+| 5m K线 | `/api/v5/market/history-candles` | 5 分钟（主时间框架） |
+| 15m K线 | `/api/v5/market/history-candles` | 15 分钟 |
+| 1H K线 | `/api/v5/market/history-candles` | 1 小时 |
+| 资金费率 | `/api/v5/public/funding-rate-history` | 每 8 小时结算一次 |
+
+### 数据缓存
+
+- 缓存目录：`~/.hermes/scripts/backtest_data/`
+- 文件命名：`{SYMBOL}_{BAR}_{DAYS}d.json`
+- 已下载的数据会自动跳过，不会重复下载
+- 删除缓存文件即可重新下载
+
+### API 限制
+
+- OKX 公开 API 无需 API Key
+- 每次请求最多 300 根 K线
+- 天数较多时自动分页（300根/次）
+- 已内置速率控制（每次请求间隔 100-150ms）
+
+---
+
+## 输出说明
+
+### 终端报告
+
+```
+============================================================
+📊 回测报告 — momentum
+============================================================
+  初始余额:  $20.00
+  最终余额:  $21.35
+  总净利润:  $1.3500 (6.75%)
+  总手续费:  $0.2100
+  总资金费率: $0.0800
+  总交易数:  15
+  胜率:      60.0% (9W/6L)
+  平均盈利:  $0.4500
+  平均亏损:  $-0.2800
+  盈亏比:    1.61
+  最大回撤:  $0.8500 (4.02%)
+
+  品种                    交易   胜率     净利润
+  --------------------------------------------
+  PEPE-USDT-SWAP            5   80% $  0.8200
+  DOGE-USDT-SWAP            3   67% $  0.3300
+  SOL-USDT-SWAP             4   50% $  0.1500
+  BTC-USDT-SWAP             3   33% $  0.0500
+
+  平仓原因:
+    TP: 9
+    SL: 3
+    TIMEOUT: 3
+============================================================
+```
+
+### HTML 报告
+
+自动生成到 `backtest_reports/` 目录，包含：
+
+- 📊 关键指标卡片（余额/净利润/胜率/最大回撤）
+- 📈 权益曲线图（Canvas 绘制）
+- 📋 完整交易记录表
+
+文件名格式：`report_{策略名}_{时间戳}.html`
+
+### 交易记录 JSON
+
+同时保存 JSON 格式交易记录，方便程序化分析：
+
+文件名格式：`trades_{策略名}_{时间戳}.json`
+
+每笔交易包含：
+```json
+{
+  "symbol": "BTC-USDT-SWAP",
+  "direction": "LONG",
+  "entry_price": 80500.0,
+  "close_price": 82915.0,
+  "size": 1,
+  "notional": 805.0,
+  "open_time": 1778400000000,
+  "close_time": 1778401800000,
+  "close_reason": "TP",
+  "pnl": 24.15,
+  "fee_paid": 0.805,
+  "funding_paid": 0.12,
+  "total_cost": 0.925,
+  "net_pnl": 23.225,
+  "duration_seconds": 1800
+}
+```
+
+---
+
+## 项目结构
+
+```
+okx_backtest.py              # 主程序 (回测引擎 + CLI)
+backtest_data/               # 历史数据缓存 (自动创建)
+  BTC-USDT-SWAP_5m_7d.json
+  BTC-USDT-SWAP_1m_7d.json
+  BTC-USDT-SWAP_15m_7d.json
+  BTC-USDT-SWAP_1H_7d.json
+  BTC-USDT-SWAP_funding_7d.json
+  ...
+backtest_reports/            # 回测报告输出 (自动创建)
+  report_momentum_20260510_193955.html
+  trades_momentum_20260510_193955.json
+```
+
+---
+
+## 常见问题
+
+### Q: 回测结果 0 笔交易怎么办？
+
+可能原因：
+1. **品种太少或波动太小** — 换高波动品种（PEPE, DOGE, WIF, BONK 等 meme 币）
+2. **天数不够** — 加大 `--days`
+3. **策略太严格** — 降低评分阈值或放宽过滤条件
+
+```bash
+# 推荐：高波动品种
+python3 okx_backtest.py backtest --strategy dual_channel --symbols PEPE,DOGE,WIF,BONK,SOL --days 14
+```
+
+### Q: 数据下载很慢？
+
+- OKX API 有速率限制，每个品种约需 1 秒
+- 10 个品种 × 4 时间框架 ≈ 10-15 秒
+- 数据已缓存，第二次运行会直接读缓存
+
+### Q: 如何回测自定义参数组合？
+
+```bash
+# 参数扫描示例
+for tp in 1.5 2.0 2.5 3.0; do
+  for sl in 0.8 1.0 1.5 2.0; do
+    python3 okx_backtest.py backtest --strategy momentum \
+      --symbols PEPE,DOGE --days 7 --tp $tp --sl $sl \
+      2>&1 | grep "总净利润"
+  done
+done
+```
+
+### Q: 回测和实盘有什么区别？
+
+| 差异 | 回测 | 实盘 |
+|------|------|------|
+| 滑点 | 无（按收盘价） | 有 |
+| 延迟 | 无 | 有（网络+API） |
+| 流动性 | 假设无限 | 有限 |
+| 追踪止损 | 逐根检查 | 逐秒检查 |
+| 资金费率 | 按最近费率近似 | 精确到结算时刻 |
+
+**建议**：回测结果 × 0.7-0.8 作为实盘预期更合理。
+
+### Q: 如何分析历史数据？
+
+```python
+import json
+
+with open("backtest_reports/trades_momentum_xxx.json") as f:
+    trades = json.load(f)
+
+# 打印每笔交易
+for t in trades:
+    print(f"{t['symbol']} {t['direction']} PnL=${t['net_pnl']:.4f} ({t['close_reason']})")
+
+# 按品种统计
+from collections import defaultdict
+stats = defaultdict(lambda: {"count": 0, "pnl": 0})
+for t in trades:
+    stats[t["symbol"]]["count"] += 1
+    stats[t["symbol"]]["pnl"] += t["net_pnl"]
+
+for sym, s in sorted(stats.items(), key=lambda x: x[1]["pnl"], reverse=True):
+    print(f"{sym}: {s['count']} trades, ${s['pnl']:.4f}")
+```
+
+---
+
+## License
+
+MIT — 仅供学习和研究目的。加密货币合约交易风险极高，请谨慎使用。
