@@ -380,7 +380,7 @@ def find_funding_at(funding_list, ts_ms):
         if diff < best_diff:
             best_diff = diff
             best = float(fr.get("fundingRate", 0))
-    return best if best is not None else 0
+    return best
 
 
 # ============================================================
@@ -419,11 +419,12 @@ class BaseStrategy:
 
 class Signal:
     """交易信号"""
-    def __init__(self, symbol, direction, score=0, reason=""):
+    def __init__(self, symbol, direction, score=0, reason="", channel=""):
         self.symbol = symbol
         self.direction = direction  # "LONG" or "SHORT"
         self.score = score
         self.reason = reason
+        self.channel = channel or direction
 
 
 class MomentumStrategy(BaseStrategy):
@@ -652,14 +653,50 @@ class Position:
             "funding_paid": self.funding_paid,
             "total_cost": self.total_cost,
             "net_pnl": self.pnl - self.total_cost,
-            "duration_seconds": self.close_time - self.open_time if self.close_time else 0,
+            "duration_seconds": (self.close_time - self.open_time) / 1000 if self.close_time and self.open_time else 0,
         }
+
+
+def fetch_instruments_cache(symbols):
+    """从OKX API获取合约面值(ctVal)"""
+    cache_file = os.path.join(DATA_DIR, "instruments_cache.json")
+    # 缓存1天
+    if os.path.exists(cache_file):
+        age = time.time() - os.path.getmtime(cache_file)
+        if age < 86400:
+            with open(cache_file) as f:
+                return json.load(f)
+
+    ct_map = {}
+    # 批量获取
+    d = http_get(f"{BASE_URL}/api/v5/public/instruments?instType=SWAP&instId=placeholder", timeout=10)
+    # OKX 不支持批量，逐个查
+    for sym in symbols:
+        try:
+            url = f"{BASE_URL}/api/v5/public/instruments?instType=SWAP&instId={sym}"
+            d = http_get(url, timeout=10)
+            if d.get("data"):
+                inst = d["data"][0]
+                ct_map[sym] = {
+                    "ctVal": float(inst.get("ctVal", "1")),
+                    "ctMult": float(inst.get("ctMult", "1")),
+                    "tickSz": inst.get("tickSz", "0.00001"),
+                    "minSz": inst.get("minSz", "1"),
+                    "lotSz": inst.get("lotSz", "1"),
+                }
+        except:
+            pass
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(cache_file, "w") as f:
+        json.dump(ct_map, f)
+    return ct_map
 
 
 class BacktestEngine:
     """回测引擎"""
 
-    def __init__(self, strategy, config=None):
+    def __init__(self, strategy, config=None, instruments_cache=None):
         self.strategy = strategy
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self.balance = self.config["initial_balance"]
@@ -669,30 +706,25 @@ class BacktestEngine:
         self.equity_curve = []     # 权益曲线
         self.cooldown_until = {}   # {symbol: timestamp}
         self.consec_loss = 0       # 连亏计数
+        self.instruments_cache = instruments_cache or {}
 
     def _fee(self, notional, is_taker=True):
         rate = self.config["taker_fee"] if is_taker else self.config["maker_fee"]
         return notional * rate
 
     def _calc_position_size(self, balance, price, symbol):
-        """计算仓位大小 (张数)"""
-        ct_val = 0.001  # 默认合约面值
-        # 从 symbol 名推断
-        major = ["BTC", "ETH"]
-        base = symbol.split("-")[0]
-        if base in major:
-            ct_val = 0.01
-        elif base in ["SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT", "MATIC"]:
-            ct_val = 1
-        elif base in ["PEPE", "WIF", "BONK", "FLOKI", "SHIB"]:
-            ct_val = 1000
-        else:
-            ct_val = 1
+        """计算仓位大小 (张数) — 从 instruments cache 获取真实 ctVal"""
+        inst_info = self.instruments_cache.get(symbol, {})
+        ct_val = inst_info.get("ctVal", 1)
+        min_sz = float(inst_info.get("minSz", "1"))
+        lot_sz = float(inst_info.get("lotSz", "1"))
 
         leverage = self.config["leverage"]
         margin = balance * self.config["position_pct"]
         notional_max = margin * leverage
-        lots = int(notional_max / (ct_val * price))
+        raw_lots = notional_max / (ct_val * price)
+        lots = int(raw_lots / lot_sz) * int(lot_sz) if lot_sz >= 1 else int(raw_lots)
+        lots = max(lots, int(min_sz))
         notional_actual = lots * ct_val * price
         return lots, notional_actual, ct_val
 
@@ -701,17 +733,17 @@ class BacktestEngine:
         if len(self.positions) >= self.config["max_positions"]:
             return None
 
-        # 检查冷却
+        # 检查冷却（cooldown_until 是 ms + cooldown_sec*1000）
         if signal.symbol in self.cooldown_until:
             if timestamp < self.cooldown_until[signal.symbol]:
                 return None
 
-        # 检查连亏暂停
+        # 检查连亏暂停（close_time是ms，cooldown是秒，需要换算）
         if self.consec_loss >= self.config["max_consecutive_loss"]:
             # 找最近一笔的时间
             if self.closed_trades:
                 last_close = max(t.close_time for t in self.closed_trades)
-                if timestamp - last_close < self.config["cooldown_after_consec_loss"]:
+                if (timestamp - last_close) / 1000 < self.config["cooldown_after_consec_loss"]:
                     return None
             self.consec_loss = 0  # 重置
 
@@ -749,10 +781,12 @@ class BacktestEngine:
         self.positions.append(pos)
         return pos
 
-    def update_positions(self, timestamp, high, low, close, fr_rate=0):
-        """更新持仓，检查止盈止损"""
+    def update_positions(self, timestamp, high, low, close, fr_rate=0, symbol=None):
+        """更新持仓，检查止盈止损。symbol=None 表示更新所有持仓，否则只更新指定品种。"""
         to_close = []
         for pos in self.positions:
+            if symbol and pos.symbol != symbol:
+                continue
             if pos.direction == "LONG":
                 # 浮盈 %
                 pnl_pct = (close - pos.entry_price) / pos.entry_price
@@ -805,12 +839,13 @@ class BacktestEngine:
                         pos.sl_price = trail_sl
 
             # === 时间止损 ===
-            elapsed = timestamp - pos.open_time
-            if elapsed >= self.config["time_stop_seconds"]:
+            elapsed_ms = timestamp - pos.open_time
+            elapsed_sec = elapsed_ms / 1000
+            if elapsed_sec >= self.config["time_stop_seconds"]:
                 if pnl_pct > self.config["time_stop_breakeven_pct"]:
                     # 保本追踪
                     pos.sl_price = pos.entry_price * 1.001 if pos.direction == "LONG" else pos.entry_price * 0.999
-                elif elapsed >= self.config["time_stop_seconds"] * 2:
+                elif elapsed_sec >= self.config["time_stop_seconds"] * 2:
                     # 双倍时间强制平仓
                     pos.close_price = close
                     pos.close_time = timestamp
@@ -818,10 +853,13 @@ class BacktestEngine:
                     to_close.append(pos)
                     continue
 
-            # === 资金费率成本 ===
-            if fr_rate != 0:
-                fr_cost = abs(pos.notional) * abs(fr_rate)
-                pos.funding_paid += fr_cost
+            # === 资金费率成本（只在OKX结算时间扣除: 00:00/08:00/16:00 UTC）===
+            if fr_rate is not None and fr_rate != 0:
+                from datetime import datetime as _dt, timezone as _tz
+                bar_dt = _dt.fromtimestamp(timestamp / 1000, tz=_tz.utc)
+                if bar_dt.hour in (0, 8, 16) and bar_dt.minute < 5:
+                    fr_cost = abs(pos.notional) * abs(fr_rate)
+                    pos.funding_paid += fr_cost
 
         # 平仓
         for pos in to_close:
@@ -852,17 +890,21 @@ class BacktestEngine:
         if pos.net_pnl < 0:
             self.consec_loss += 1
             if self.consec_loss >= self.config["max_consecutive_loss"]:
-                # 设置冷却
+                # 设置冷却（close_time是ms，cooldown转为ms）
                 for p in self.positions:
-                    self.cooldown_until[p.symbol] = pos.close_time + self.config["cooldown_after_consec_loss"]
+                    self.cooldown_until[p.symbol] = pos.close_time + self.config["cooldown_after_consec_loss"] * 1000
         else:
             self.consec_loss = 0
 
-        # 设置品种冷却
-        self.cooldown_until[pos.symbol] = pos.close_time + self.config["cooldown_seconds"]
+        # 设置品种冷却（close_time是ms，cooldown转为ms）
+        self.cooldown_until[pos.symbol] = pos.close_time + self.config["cooldown_seconds"] * 1000
 
     def run(self, all_data):
         """运行回测"""
+        if not self.instruments_cache:
+            print("📡 获取合约规格...")
+            self.instruments_cache = fetch_instruments_cache(list(all_data.keys()))
+            print(f"   缓存: {len(self.instruments_cache)} 个合约")
         print(f"\n🚀 回测启动: {self.strategy.name}")
         print(f"   余额: ${self.initial_balance:.2f} | 杠杆: {self.config['leverage']}x")
         print(f"   TP: {self.config['tp_pct']*100:.1f}% | SL: {self.config['sl_pct']*100:.1f}%")
@@ -891,6 +933,9 @@ class BacktestEngine:
         total_bars = len(sorted_times)
         print(f"📊 时间线: {total_bars} 根5m K线, {len(all_data)} 品种")
 
+        # 跟踪每个品种的最新收盘价（用于权益曲线计算）
+        latest_close = {}  # {symbol: price}
+
         for bar_num, ts in enumerate(sorted_times):
             for item in timeline[ts]:
                 symbol = item["symbol"]
@@ -902,9 +947,9 @@ class BacktestEngine:
                 t = item["ts"]
                 data = all_data[symbol]
 
-                # 更新已有持仓
+                # 更新已有持仓（只更新当前品种的持仓）
                 fr = find_funding_at(data.get("funding", []), ts)
-                self.update_positions(ts, h[i], lo[i], c[i], fr)
+                self.update_positions(ts, h[i], lo[i], c[i], fr or 0, symbol=symbol)
 
                 # 构建 ctx
                 ctx = {
@@ -931,13 +976,17 @@ class BacktestEngine:
                         continue
                     self.open_trade(sig, ts, c[i], fr)
 
-            # 记录权益
+                # 更新该品种的最新收盘价
+                latest_close[symbol] = c[i]
+
+            # 记录权益（用每个品种在当前时间点的最新收盘价）
             unrealized = 0
             for pos in self.positions:
+                cur_price = latest_close.get(pos.symbol, pos.entry_price)
                 if pos.direction == "LONG":
-                    unrealized += (c[pos.symbol][-1] - pos.entry_price) / pos.entry_price * pos.notional
+                    unrealized += (cur_price - pos.entry_price) / pos.entry_price * pos.notional
                 else:
-                    unrealized += (pos.entry_price - c[pos.symbol][-1]) / pos.entry_price * pos.notional
+                    unrealized += (pos.entry_price - cur_price) / pos.entry_price * pos.notional
             self.equity_curve.append({
                 "timestamp": ts,
                 "balance": self.balance,
@@ -954,12 +1003,14 @@ class BacktestEngine:
         if self.positions:
             print(f"\n⚠️ 还有 {len(self.positions)} 个持仓，强制平仓")
             last_ts = sorted_times[-1] if sorted_times else 0
+            # 用最后一根K线的收盘价平仓
+            last_close_map = {}
+            for sym_key in all_data:
+                c5m = all_data[sym_key].get("5m", [])
+                if c5m:
+                    last_close_map[sym_key] = float(c5m[-1][4])
             for pos in list(self.positions):
-                pos.close_price = pos.entry_price  # 简化：按入场价平
-                if pos.symbol in all_data:
-                    c = all_data[pos.symbol].get("5m", [])
-                    if c:
-                        pos.close_price = float(c[-1][4])
+                pos.close_price = last_close_map.get(pos.symbol, pos.entry_price)
                 pos.close_time = last_ts
                 pos.close_reason = "FORCE_CLOSE"
                 self._close_position(pos)
@@ -1224,7 +1275,8 @@ def cmd_backtest(args):
         config["sl_pct"] = args.sl / 100
 
     strategy.config.update(config)
-    engine = BacktestEngine(strategy, config)
+    instruments = fetch_instruments_cache(symbols)
+    engine = BacktestEngine(strategy, config, instruments_cache=instruments)
     trades, equity = engine.run(data)
 
     # 保存报告
@@ -1270,8 +1322,8 @@ def main():
     p_bt.add_argument("--days", type=int, default=7, help="回测天数")
     p_bt.add_argument("--balance", type=float, help="初始余额")
     p_bt.add_argument("--leverage", type=int, help="杠杆倍数")
-    p_bt.add_argument("--tp", type=float, help="止盈%")
-    p_bt.add_argument("--sl", type=float, help="止损%")
+    p_bt.add_argument("--tp", type=float, help="止盈%%")
+    p_bt.add_argument("--sl", type=float, help="止损%%")
 
     # list
     p_ls = sub.add_parser("list", help="列出可用合约")
