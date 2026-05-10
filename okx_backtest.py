@@ -194,8 +194,11 @@ def download_all(symbol_list, days=7):
     }
 
     all_data = {}
-    for inst_id in symbol_list:
+    total = len(symbol_list)
+    for idx, inst_id in enumerate(symbol_list):
         all_data[inst_id] = {}
+        if total > 10:
+            print(f"\n  [{idx+1}/{total}] {inst_id}")
         for bar, bar_sec in timeframes.items():
             cache_key = f"{inst_id}_{bar}_{days}d"
             cache_file = os.path.join(DATA_DIR, f"{cache_key}.json")
@@ -1223,16 +1226,26 @@ def load_custom_strategy(path):
 # ============================================================
 def cmd_download(args):
     """下载数据"""
-    symbols = [s.strip().upper() + "-USDT-SWAP" for s in args.symbols.split(",")]
-    print(f"📥 下载 {len(symbols)} 个品种 {args.days}天 数据...")
+    if args.all_market:
+        # 全市场模式: 按成交量排序取 Top N
+        all_syms = get_all_swap_symbols()
+        symbols = [s["instId"] for s in all_syms[:args.top]]
+        print(f"📥 全市场下载: Top {args.top} 品种 {args.days}天")
+        print(f"   品种列表:")
+        for s in symbols:
+            print(f"     {s}")
+    else:
+        symbols = [s.strip().upper() + "-USDT-SWAP" for s in args.symbols.split(",")]
+        print(f"📥 下载 {len(symbols)} 个品种 {args.days}天 数据...")
+
     data = download_all(symbols, days=args.days)
-    print(f"✅ 下载完成")
+    print(f"\n✅ 下载完成: {len(data)} 个品种")
 
     # 列出可用品种
     all_syms = get_all_swap_symbols()
-    print(f"\n📋 所有可用 USDT-SWAP 合约: {len(all_syms)} 个")
-    if args.list:
-        for s in all_syms[:50]:
+    print(f"📋 所有可用 USDT-SWAP 合约: {len(all_syms)} 个")
+    if args.list or args.all_market:
+        for s in all_syms[:min(args.top, len(all_syms))]:
             print(f"  {s['instId']:<25} 24h vol: ${s['vol24h']:>12,.0f}")
 
 
@@ -1249,7 +1262,14 @@ def cmd_backtest(args):
         return
 
     # 确定品种
-    if args.symbols:
+    if getattr(args, 'all_market', False):
+        # 全市场模式: 按成交量排序取 Top N（和实盘逻辑一致）
+        all_syms = get_all_swap_symbols()
+        symbols = [s["instId"] for s in all_syms[:args.top]]
+        print(f"📋 全市场模式: Top {args.top} 品种")
+        for i, s in enumerate(symbols):
+            print(f"   {i+1:>2}. {s} (${all_syms[i]['vol24h']:,.0f})")
+    elif args.symbols:
         symbols = [s.strip().upper() + "-USDT-SWAP" for s in args.symbols.split(",")]
     else:
         # 自动选 top 10
@@ -1311,6 +1331,10 @@ def main():
     p_dl.add_argument("--symbols", default="BTC,ETH,SOL,DOGE,XRP,PEPE,WIF,AVAX,LINK,BONK",
                        help="品种列表,逗号分隔")
     p_dl.add_argument("--days", type=int, default=7, help="天数")
+    p_dl.add_argument("--all", action="store_true", dest="all_market",
+                       help="全市场模式: 自动下载成交量Top N品种")
+    p_dl.add_argument("--top", type=int, default=80,
+                       help="全市场模式下载数量 (默认80)")
     p_dl.add_argument("--list", action="store_true", help="列出所有可用合约")
 
     # backtest
@@ -1319,6 +1343,10 @@ def main():
                        help="策略名称或.py文件路径")
     p_bt.add_argument("--symbols", default="",
                        help="品种列表 (空=自动Top10)")
+    p_bt.add_argument("--all", action="store_true", dest="all_market",
+                       help="全市场模式: 自动选成交量Top N品种回测")
+    p_bt.add_argument("--top", type=int, default=80,
+                       help="全市场模式品种数量 (默认80)")
     p_bt.add_argument("--days", type=int, default=7, help="回测天数")
     p_bt.add_argument("--balance", type=float, help="初始余额")
     p_bt.add_argument("--leverage", type=int, help="杠杆倍数")
