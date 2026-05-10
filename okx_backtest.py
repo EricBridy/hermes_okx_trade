@@ -167,16 +167,17 @@ def download_candles(inst_id, bar, days, bar_seconds):
     return sorted(all_candles, key=lambda x: int(x[0]))
 
 
-def download_all(symbol_list, days=7):
-    """下载所有数据"""
+def download_all(symbol_list, days=7, timeframes=None):
+    """下载所有数据。timeframes=None时下载全部，否则只下载指定的时间框架。"""
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    timeframes = {
-        "1m": 60,
-        "5m": 300,
-        "15m": 900,
-        "1H": 3600,
-    }
+    if timeframes is None:
+        timeframes = {
+            "1m": 60,
+            "5m": 300,
+            "15m": 900,
+            "1H": 3600,
+        }
 
     all_data = {}
     total = len(symbol_list)
@@ -586,11 +587,179 @@ class DualChannelStrategy(BaseStrategy):
         return signals
 
 
+# ============================================================
+# V7.x Strategy Implementations (matching live trading logic)
+# ============================================================
+
+class ChannelAStrategy:
+    def __init__(self, version="v77"):
+        self.version = version
+        self.long_only = (version in ("v75", "v76"))
+        self.use_adx_bb = (version == "v77")
+
+    def check(self, ctx, fr):
+        c = ctx["closes"]
+        v = ctx["vols"]
+        abs_fr = abs(fr)
+        if abs_fr < 0.0005 or abs_fr > 0.01:
+            return None
+        vol_recent = sum(v[-3:]) / 3
+        vol_history = sum(v[:-3]) / max(len(v[:-3]), 1)
+        vol_ratio = vol_recent / max(vol_history, 0.001)
+        if vol_ratio < 1.3:
+            return None
+        chg_5m = (c[-1] - c[-5]) / c[-5] * 100 if c[-5] != 0 else 0
+        rsi = calc_rsi(c)
+        if self.use_adx_bb:
+            adx = calc_adx(ctx["highs"], ctx["lows"], c)
+            bb = calc_bb_width(c)
+            if adx is not None and adx >= 40:
+                return None
+            if bb is not None and bb < 1.5:
+                return None
+        if fr < 0 and chg_5m > 0.1:
+            if rsi > 70:
+                return None
+            return Signal(ctx["symbol"], "LONG", abs_fr * 10000, "FR={:.6f}".format(fr))
+        elif fr > 0 and not self.long_only and chg_5m < -0.1:
+            if rsi < 30:
+                return None
+            if self.use_adx_bb:
+                roc = calc_roc(c)
+                if roc is not None and roc > 0:
+                    return None
+            return Signal(ctx["symbol"], "SHORT", abs_fr * 10000, "FR={:.6f}".format(fr))
+        return None
+
+
+class ChannelBStrategy:
+    def __init__(self, version="v77"):
+        self.version = version
+        self.score_threshold = 5 if version == "v75" else 8
+        self.use_extra_filters = (version == "v77")
+
+    def check(self, ctx, fr):
+        c = ctx["closes"]
+        v = ctx["vols"]
+        chg_5m = (c[-1] - c[-5]) / c[-5] * 100 if c[-5] != 0 else 0
+        if abs(chg_5m) < 0.1:
+            return None
+        direction = "LONG" if chg_5m > 0 else "SHORT"
+        rsi = calc_rsi(c)
+        if direction == "SHORT" and rsi > 65:
+            return None
+        if self.use_extra_filters:
+            adx = calc_adx(ctx["highs"], ctx["lows"], c)
+            bb = calc_bb_width(c)
+            roc = calc_roc(c)
+            if adx is not None and adx >= 40:
+                return None
+            if bb is not None and bb < 1.5:
+                return None
+            if roc is not None:
+                if direction == "SHORT" and roc > 0:
+                    return None
+                if direction == "LONG" and roc < 0:
+                    return None
+        score = 0
+        abs_chg = abs(chg_5m)
+        if abs_chg > 2: score += 3
+        elif abs_chg > 1: score += 2
+        elif abs_chg > 0.5: score += 1
+        vol_recent = sum(v[-3:]) / 3
+        vol_history = sum(v[:-3]) / max(len(v[:-3]), 1)
+        vol_ratio = vol_recent / max(vol_history, 0.001)
+        if vol_ratio > 3: score += 3
+        elif vol_ratio > 2: score += 2
+        elif vol_ratio > 1.5: score += 1
+        ups = sum(1 for i in range(1, min(30, len(c))) if c[-i] > c[-i-1])
+        downs = sum(1 for i in range(1, min(30, len(c))) if c[-i] < c[-i-1])
+        if ups > 12 or downs > 12: score += 2
+        elif ups > 10 or downs > 10: score += 1
+        if fr is not None:
+            if (fr < 0 and chg_5m > 0) or (fr > 0 and chg_5m < 0):
+                score += 1
+        # 15m trend alignment
+        if len(c) >= 6:
+            chg_15m = (c[-1] - c[-6]) / c[-6] * 100
+            if chg_15m > 0.3: trend_15m = "UP"
+            elif chg_15m < -0.3: trend_15m = "DOWN"
+            else: trend_15m = "FLAT"
+            if self.version in ("v76", "v77"):
+                if direction == "LONG" and trend_15m != "UP": return None
+                if direction == "SHORT" and trend_15m != "DOWN": return None
+            if trend_15m == "UP" and direction == "LONG": score += 1
+            if trend_15m == "DOWN" and direction == "SHORT": score += 1
+        if score >= self.score_threshold:
+            return Signal(ctx["symbol"], direction, score, "score={}".format(score))
+        return None
+
+
+class V75Strategy(BaseStrategy):
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.name = "v75"
+        self.ch_a = ChannelAStrategy("v75")
+        self.ch_b = ChannelBStrategy("v75")
+
+    def on_bar(self, ctx):
+        if len(ctx["closes"]) < 50: return []
+        fr = find_funding_at(ctx["funding"], ctx["timestamps"][-1])
+        if fr is None: return []
+        signals = []
+        sig_a = self.ch_a.check(ctx, fr)
+        if sig_a: sig_a.channel = "A"; signals.append(sig_a)
+        sig_b = self.ch_b.check(ctx, fr)
+        if sig_b: sig_b.channel = "B"; signals.append(sig_b)
+        return signals
+
+
+class V76Strategy(BaseStrategy):
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.name = "v76"
+        self.ch_a = ChannelAStrategy("v76")
+        self.ch_b = ChannelBStrategy("v76")
+
+    def on_bar(self, ctx):
+        if len(ctx["closes"]) < 50: return []
+        fr = find_funding_at(ctx["funding"], ctx["timestamps"][-1])
+        if fr is None: return []
+        signals = []
+        sig_a = self.ch_a.check(ctx, fr)
+        if sig_a: sig_a.channel = "A"; signals.append(sig_a)
+        sig_b = self.ch_b.check(ctx, fr)
+        if sig_b: sig_b.channel = "B"; signals.append(sig_b)
+        return signals
+
+
+class V77Strategy(BaseStrategy):
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.name = "v77"
+        self.ch_a = ChannelAStrategy("v77")
+        self.ch_b = ChannelBStrategy("v77")
+
+    def on_bar(self, ctx):
+        if len(ctx["closes"]) < 50: return []
+        fr = find_funding_at(ctx["funding"], ctx["timestamps"][-1])
+        if fr is None: return []
+        signals = []
+        sig_a = self.ch_a.check(ctx, fr)
+        if sig_a: sig_a.channel = "A"; signals.append(sig_a)
+        sig_b = self.ch_b.check(ctx, fr)
+        if sig_b: sig_b.channel = "B"; signals.append(sig_b)
+        return signals
+
+
 # 策略注册表
 STRATEGIES = {
     "momentum": MomentumStrategy,
     "funding_reversal": FundingReversalStrategy,
     "dual_channel": DualChannelStrategy,
+    "v75": V75Strategy,
+    "v76": V76Strategy,
+    "v77": V77Strategy,
 }
 
 
@@ -1229,7 +1398,14 @@ def cmd_download(args):
         symbols = [s.strip().upper() + "-USDT-SWAP" for s in args.symbols.split(",")]
         print(f"📥 下载 {len(symbols)} 个品种 {args.days}天 数据...")
 
-    data = download_all(symbols, days=args.days)
+    # 解析时间框架
+    tf_map = {"1m": 60, "5m": 300, "15m": 900, "1H": 3600}
+    if args.timeframes:
+        timeframes = {k: v for k, v in tf_map.items() if k in [t.strip() for t in args.timeframes.split(",")]}
+    else:
+        timeframes = None
+
+    data = download_all(symbols, days=args.days, timeframes=timeframes)
     print(f"\n✅ 下载完成: {len(data)} 个品种")
 
     # 列出可用品种
@@ -1270,9 +1446,16 @@ def cmd_backtest(args):
         for s in symbols:
             print(f"   {s}")
 
+    # 解析时间框架
+    tf_map = {"1m": 60, "5m": 300, "15m": 900, "1H": 3600}
+    if args.timeframes:
+        timeframes = {k: v for k, v in tf_map.items() if k in [t.strip() for t in args.timeframes.split(",")]}
+    else:
+        timeframes = None  # 全部
+
     # 下载数据
     print(f"\n📥 准备数据 ({args.days}天)...")
-    data = download_all(symbols, days=args.days)
+    data = download_all(symbols, days=args.days, timeframes=timeframes)
 
     # 运行
     config = {}
@@ -1326,6 +1509,8 @@ def main():
                        help="全市场模式: 自动下载成交量Top N品种")
     p_dl.add_argument("--top", type=int, default=80,
                        help="全市场模式下载数量 (默认80)")
+    p_dl.add_argument("--timeframes", default="",
+                       help="时间框架(逗号分隔,如5m,15m)。留空=全部")
     p_dl.add_argument("--list", action="store_true", help="列出所有可用合约")
 
     # backtest
@@ -1343,6 +1528,8 @@ def main():
     p_bt.add_argument("--leverage", type=int, help="杠杆倍数")
     p_bt.add_argument("--tp", type=float, help="止盈%%")
     p_bt.add_argument("--sl", type=float, help="止损%%")
+    p_bt.add_argument("--timeframes", default="",
+                       help="时间框架(逗号分隔,如5m,15m)。留空=全部")
 
     # list
     p_ls = sub.add_parser("list", help="列出可用合约")
