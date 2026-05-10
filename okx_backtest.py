@@ -24,24 +24,9 @@ import sys
 import json
 import time
 import math
-import hashlib
 import argparse
-import statistics
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-try:
-    import pandas as pd
-    HAS_PANDAS = True
-except ImportError:
-    HAS_PANDAS = False
-
-try:
-    from tabulate import tabulate
-    HAS_TABULATE = True
-except ImportError:
-    HAS_TABULATE = False
 
 # ============================================================
 # CONFIG
@@ -671,9 +656,7 @@ def fetch_instruments_cache(symbols):
                 return json.load(f)
 
     ct_map = {}
-    # 批量获取
-    d = http_get(f"{BASE_URL}/api/v5/public/instruments?instType=SWAP&instId=placeholder", timeout=10)
-    # OKX 不支持批量，逐个查
+    # OKX 不支持批量查询，逐个获取合约规格
     for sym in symbols:
         try:
             url = f"{BASE_URL}/api/v5/public/instruments?instType=SWAP&instId={sym}"
@@ -726,8 +709,16 @@ class BacktestEngine:
         margin = balance * self.config["position_pct"]
         notional_max = margin * leverage
         raw_lots = notional_max / (ct_val * price)
-        lots = int(raw_lots / lot_sz) * int(lot_sz) if lot_sz >= 1 else int(raw_lots)
-        lots = max(lots, int(min_sz))
+        # 按 lot_sz 取整（lot_sz 可以是 1、0.1、0.01 等）
+        if lot_sz >= 1:
+            lots = int(raw_lots / int(lot_sz)) * int(lot_sz)
+        else:
+            lots = int(raw_lots / lot_sz) * lot_sz
+        # 确保不低于最小交易量
+        min_lots = float(min_sz)
+        if lots < min_lots:
+            lots = min_lots
+        lots = int(lots) if lot_sz >= 1 else lots  # 保留小数张（如有）
         notional_actual = lots * ct_val * price
         return lots, notional_actual, ct_val
 
