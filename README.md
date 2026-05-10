@@ -191,15 +191,16 @@ CHAIN_API_TIMEOUT = 3           # 链上API超时 3秒
 
 | 文件 | 说明 |
 |------|------|
-| `v76_yao_hunter.py` | v7.6 主程序 — 2仓位+多空兼顾+硬性过滤+降噪 |
-| `v76_state.json` | 运行状态（连亏计数、冷却记录） |
-| `v76_trades.log` | 交易日志 |
-| `v76_chain_cache.json` | 链上数据缓存（持久化到磁盘） |
+| `v77_yao_hunter.py` | v7.7 主程序 — ADX/BB/ROC过滤 |
+| `v76_yao_hunter.py` | v7.6 主程序 |
+| `okx_backtest.py` | 通用回测框架 (backtest分支) |
+| `backtest_data/` | 回测数据缓存 |
+| `backtest_reports/` | 回测报告输出 |
 
 ## 运行环境
 
 - **Python 3.8+**
-- **依赖**：requests（无额外依赖）
+- **依赖**：纯标准库（回测框架无第三方依赖）
 - **交易所**：OKX（需 API Key + Secret + Passphrase）
 - **服务器**：轻量级，2 核 2G 即可
 
