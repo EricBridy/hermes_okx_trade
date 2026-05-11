@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-OKX 妖币猎手 v7.7 — 2仓位+多空兼顾+技术指标过滤(ADX/BB/ROC)
+OKX 妖币猎手 v7.8 — 2仓位+多空兼顾+EMA/ADX/BB/ROC/Stoch多维过滤
 通道A: 极端FR+技术指标验证（FR<0做多/FR>0做空，需K线趋势一致）
-通道B: 动量顺势（评分>=8，做空需RSI<65+15m趋势向下）
+通道B: 动量顺势（评分>=10，EMA排列+5m量能+Stochastic时机）
 
-v7.6优化（基于v7.5复盘数据）：
-- 砍掉RISING急速上升（9笔净亏$0.55，rank跳变≠趋势）
-- 通道B门槛 score>=5 → score>=8（过滤弱信号）
-- 时间止损 15分钟 → 8分钟（浮盈>0.5%保本追踪）
-- 评分归零不立即换仓，需价格也反向才换
-- 通道A多空兼顾：FR<0做多+FR>0做空，需K线趋势一致
-- 做空硬性过滤：RSI<65且15m趋势向下
+v7.8优化（基于v7.6复盘数据，目标Channel B胜率43%→70%+）：
+- EMA(12,26)排列过滤：无趋势骨架=不开仓（假突破最大元凶）
+- 5m成交量确认：近期5m量>均值*1.1才确认资金参与
+- Stochastic入场时机：超买区不做多/超卖区不做空（避免追极端）
+- 评分门槛 8→10：过滤弱信号
+- 快速止损 8分钟→4分钟：动量不走=方向判断错
+- 追踪止损 1.5%→1%激活，0.8%→0.6%距离：提前锁定利润
 """
 
 import subprocess, json, time, os, hmac, base64, threading
@@ -21,9 +21,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 LEVERAGE = 6
 TP_PCT = 0.03          # 3% 止盈
 SL_PCT = 0.015         # 1.5% 止损
-TRAIL_ACTIVATE = 0.015  # 浮盈1.5%后启动追踪止损
-TRAIL_DISTANCE = 0.008  # 追踪止损距离0.8%
-TIME_STOP_SEC = 480       # 8分钟时间止损
+TRAIL_ACTIVATE = 0.010  # 浮盈1%后启动追踪止损（提前激活）
+TRAIL_DISTANCE = 0.006  # 追踪止损距离0.6%（收紧保护利润）
+TIME_STOP_SEC = 240       # 4分钟快速止损（动量不走=方向错）
 SCAN_INTERVAL = 30      # 30秒扫描
 COOLDOWN_SEC = 1200     # 同一品种冷却20分钟
 MAX_CONCURRENT = 2      # 2仓位: A独占1个+B独占1个（砍掉RISING急速上升）
@@ -39,7 +39,7 @@ CHANNEL_A_VOL_SPIKE = 1.3       # 放量阈值
 CHANNEL_A_POSITION_PCT = 0.40   # 仓位1占总资金40%
 
 # 通道B: 动量顺势
-MOMENTUM_SCORE_THRESHOLD = 8    # 综合评分>=8触发通道B
+MOMENTUM_SCORE_THRESHOLD = 10   # 综合评分>=10触发通道B（45%+质量门槛）
 CHANNEL_B_POSITION_PCT = 0.30   # 仓位2占总资金30%
 # 方向: 顺势（涨做多，跌做空）
 
@@ -579,6 +579,28 @@ def get_multi_timeframe(sym):
                 highs5 = [float(c[2]) for c in c5]
                 lows5 = [float(c[3]) for c in c5]
 
+                # === EMA(12,26) 排列（v7.8新增：趋势骨架）===
+                if len(cl5) >= 26:
+                    # EMA计算
+                    def _ema(data, period):
+                        k = 2 / (period + 1)
+                        ema_val = sum(data[:period]) / period
+                        for v in data[period:]:
+                            ema_val = v * k + ema_val * (1 - k)
+                        return ema_val
+                    ema12 = _ema(cl5, 12)
+                    ema26 = _ema(cl5, 26)
+                    result['ema12'] = ema12
+                    result['ema26'] = ema26
+                    result['ema_bullish'] = ema12 > ema26  # 多头排列
+                    result['ema_bearish'] = ema12 < ema26  # 空头排列
+
+                # === 5m成交量均值（v7.8新增：确认资金参与）===
+                if len(vl5) >= 5:
+                    avg_vol_5m = sum(vl5[:-2]) / max(len(vl5[:-2]), 1)
+                    recent_vol_5m = sum(vl5[-2:]) / 2
+                    result['vol_5m_ratio'] = recent_vol_5m / max(avg_vol_5m, 0.001)
+
                 # ADX(14) — 趋势强度（>40趋势过强，做空危险）
                 if len(highs5) >= 29:
                     _plus_dm, _minus_dm, _trs = [], [], []
@@ -878,17 +900,24 @@ def scan_dual_channel():
                     if bb_a < 1.5:
                         continue
                     
+                    # v7.8: Stochastic位置过滤（避免追极端）
+                    stoch_a = mt.get("stoch_k", 50)
+                    
                     # FR<0做多：需要5m上涨或15m向上
                     if fr < 0 and (chg_5m_a > 0.1 or trend_15m_a == "UP"):
-                        # 做多额外过滤：RSI不能超买
+                        # 做多额外过滤：RSI不能超买 + Stochastic不能超买
                         if rsi_a > 70:
                             continue
+                        if stoch_a > 80:
+                            continue  # v7.8: Stoch超买=不追
                         direction_a = "LONG"
                     # FR>0做空：需要5m下跌且15m向下
                     elif fr > 0 and chg_5m_a < -0.1 and trend_15m_a == "DOWN":
-                        # 做空额外过滤：RSI不能超卖
+                        # 做空额外过滤：RSI不能超卖 + Stochastic不能超卖
                         if rsi_a < 30:
                             continue
+                        if stoch_a < 20:
+                            continue  # v7.8: Stoch超卖=不追空
                         # v7.7: ROC确认方向（价格已在跌）
                         roc_a = mt.get("roc_10", 0)
                         if roc_a > 0:
@@ -963,6 +992,25 @@ def scan_dual_channel():
                         continue
                     if direction == "SHORT" and trend_15m != "DOWN":
                         continue
+                # v7.8: EMA排列过滤（趋势骨架）— 无EMA数据=不开仓
+                ema_bull = mt.get('ema_bullish')
+                ema_bear = mt.get('ema_bearish')
+                if ema_bull is None and ema_bear is None:
+                    continue  # 数据不足，跳过
+                if direction == "LONG" and not ema_bull:
+                    continue  # 做多需多头排列(EMA12>EMA26)
+                if direction == "SHORT" and not ema_bear:
+                    continue  # 做空需空头排列(EMA12<EMA26)
+                # v7.8: 5m成交量确认（近期5m量 > 均值*1.1 = 资金在参与）
+                vol_5m_ratio = mt.get('vol_5m_ratio', 1.0)
+                if vol_5m_ratio < 1.1:
+                    continue  # 5m量能不足=假突破风险
+                # v7.8: Stochastic入场时机（避免追极端位置）
+                stoch_k = mt.get('stoch_k', 50)
+                if direction == "LONG" and stoch_k > 80:
+                    continue  # 超买区做多=等回调
+                if direction == "SHORT" and stoch_k < 20:
+                    continue  # 超卖区做空=等反弹
                 channel_b_candidates.append({
                     "sym": sym,
                     "dir": direction,
@@ -1224,9 +1272,9 @@ def monitor_position(inst_id, pos_info):
         close_position(inst_id, pos_info.get("algo_ids"))
         return "PROFIT"
 
-    # 时间止损（方案3+7改进）
+    # 时间止损（v7.8: 4分钟快速止损）
     if elapsed > TIME_STOP_SEC:
-        # 8分钟后：浮盈>0.5%→保本追踪，浮盈>0→再等3分钟，否则止损
+        # 4分钟后：浮盈>0.5%→保本追踪，否则止损
         if pct_change >= 0.5:
             # 浮盈>0.5%，移动止损到开仓价（保本），然后让追踪止损接管
             if not pos_info.get("trail_activated"):
@@ -1235,8 +1283,8 @@ def monitor_position(inst_id, pos_info):
                 log(f"🔔 {inst_id} 8分钟+浮盈{pct_change:+.2f}%>0.5% → 保本追踪激活")
             return "HOLDING"
         elif pct_change > 0:
-            # 浮盈0~0.5%，再给3分钟机会（总共11分钟）
-            if elapsed > TIME_STOP_SEC + 180:
+            # 浮盈0~0.5%，再给1分钟机会（总共5分钟）
+            if elapsed > TIME_STOP_SEC + 60:
                 log(f"⏰ {inst_id} 横盘{int(elapsed)}秒 ({pct_change:+.3f}%) → 时间止损(延长)")
                 close_position(inst_id, pos_info.get("algo_ids"))
                 return "TIME_STOP"
@@ -1251,11 +1299,11 @@ def monitor_position(inst_id, pos_info):
 # ==================== 主循环 ====================
 def main():
     log("=" * 60)
-    log("🔥 OKX 妖币猎手 v7.7 启动（2仓位+多空兼顾+ADX/BB/ROC过滤）")
+    log("🔥 OKX 妖币猎手 v7.8 启动（2仓位+多空兼顾+EMA/ADX/BB/ROC/Stoch过滤）")
     log(f"  杠杆: {LEVERAGE}x  TP: {TP_PCT*100}%  SL: {SL_PCT*100}%")
-    log(f"  通道A: |FR|>{FR_EXTREME_THRESHOLD*100}%+技术验证+ADX<40+BB>1.5% 仓位{CHANNEL_A_POSITION_PCT*100:.0f}%")
-    log(f"  通道B: 动量>={MOMENTUM_SCORE_THRESHOLD}+ADX<40+BB>1.5%+ROC确认 仓位{CHANNEL_B_POSITION_PCT*100:.0f}%")
-    log(f"  v7.7过滤: ADX<40(趋势不强)+BB>1.5%(波动足够)+ROC确认方向")
+    log(f"  通道A: |FR|>{FR_EXTREME_THRESHOLD*100}%+技术验证+ADX<40+BB>1.5%+Stoch过滤 仓位{CHANNEL_A_POSITION_PCT*100:.0f}%")
+    log(f"  通道B: 动量>={MOMENTUM_SCORE_THRESHOLD}+EMA排列+5m量能+ADX<40+BB>1.5%+ROC+Stoch 仓位{CHANNEL_B_POSITION_PCT*100:.0f}%")
+    log(f"  v7.8新增: EMA(12,26)趋势骨架 + 5m量能确认 + Stochastic入场时机 + 4分钟快速止损")
     log(f"  追踪止损: 激活{TRAIL_ACTIVATE*100}% 距离{TRAIL_DISTANCE*100}%")
     log(f"  时间止损: {TIME_STOP_SEC}秒(浮盈>0.5%保本追踪)")
     log(f"  最大同时持仓: {MAX_CONCURRENT}")
