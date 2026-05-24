@@ -1,0 +1,1 @@
+{"consecutive_losses": 0, "pause_until": null, "last_trade": {"AI-USDT-SWAP": 1778763084.6500144, "CHIP-USDT-SWAP": 1778797504.9334166, "BIO-USDT-SWAP": 1778808396.3482203, "MON-USDT-SWAP": 1778781969.9821525}, "total_pnl": -0.39282000000002204, "trade_count": 9, "position_meta": {}}
