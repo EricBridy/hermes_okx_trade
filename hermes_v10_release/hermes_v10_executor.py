@@ -206,7 +206,9 @@ class Executor:
     # ----- open -----
 
     async def open_position(self, candidate: Dict[str, Any],
-                            evaluation: Dict[str, Any], capital_usd: float
+                            evaluation: Dict[str, Any], capital_usd: float,
+                            balance_usd: Optional[float] = None,
+                            max_capital_usd: Optional[float] = None
                             ) -> Optional[Position]:
         inst_id = candidate["instId"]
         spec = self.instruments.get(inst_id)
@@ -230,7 +232,27 @@ class Executor:
             log(f"  ❌ {inst_id} bad last={rows[0].get('last')!r}")
             return None
         ct_val = safe_float(spec.get("ctVal"), 1.0)
-        lots = int(notional_max / max(ct_val * last, 1e-9))
+        unit_notional = ct_val * last
+        lots = int(notional_max / max(unit_notional, 1e-9))
+        if lots < 1:
+            max_cap = max_capital_usd if max_capital_usd is not None else capital_usd
+            min_capital = unit_notional / max(leverage * 0.95, 1e-9)
+            enough_balance = balance_usd is None or min_capital <= balance_usd
+            if min_capital <= max_cap and enough_balance:
+                old_fraction = safe_float(evaluation.get("fraction"), 0.0)
+                capital_usd = min_capital
+                margin = capital_usd * 0.95
+                notional_max = margin * leverage
+                lots = 1
+                if balance_usd and balance_usd > 0:
+                    actual_fraction = capital_usd / balance_usd
+                    evaluation["fraction"] = max(old_fraction, actual_fraction)
+                    log(f"  [info] {inst_id} min-lot upsize "
+                        f"f={old_fraction:.0%}->{evaluation['fraction']:.0%} "
+                        f"capital=${capital_usd:.2f}")
+            else:
+                log(f"  [info] {inst_id} min-lot need=${min_capital:.2f} "
+                    f"headroom=${max_cap:.2f} balance=${safe_float(balance_usd):.2f}")
         if lots < 1:
             log(f"  ❌ {inst_id} lots<1 (capital=${capital_usd:.2f})")
             return None

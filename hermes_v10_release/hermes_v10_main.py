@@ -397,6 +397,9 @@ class Engine:
         if not evaluation["passes"]:
             return
         balance = await self.executor.get_balance()
+        if balance <= 0:
+            log(f"     skip {iid}: no available USDT balance")
+            return
         # 限制本笔 fraction 不超过剩余暴露空间
         current_exposure = sum(p.fraction for p in self.executor.positions.values())
         headroom = max(0.0, MAX_TOTAL_EXPOSURE - current_exposure)
@@ -408,10 +411,12 @@ class Engine:
             log(f"     {iid}: fraction 被压缩 {evaluation['fraction']:.0%} → {eff_fraction:.0%} (暴露上限)")
             evaluation["fraction"] = eff_fraction
         cap = balance * eff_fraction
-        if cap < 1.0:
-            log(f"     skip {iid}: cap ${cap:.2f} too small")
-            return
-        opened = await self.executor.open_position(candidate, evaluation, cap)
+        max_cap = balance * headroom
+        opened = await self.executor.open_position(
+            candidate, evaluation, cap,
+            balance_usd=balance,
+            max_capital_usd=max_cap,
+        )
         if opened:
             self.daily["count"] += 1
             self.state["daily_risk"] = self.daily

@@ -1,38 +1,32 @@
 # Hermes v10 / v11 Price Study
 
-Hermes 是一个基于 OKX 永续合约的自适应交易机器人。
-当前这一版的主策略已经切到价格行为学优先，核心是 `Break & Retest (BR)`。
+Hermes is an OKX-only adaptive perpetual-swap trading bot. This branch moves
+the active alpha toward price action, with Break & Retest (`BR`) as the primary
+signal family.
 
-## 当前结构
+## Files
 
-- `hermes_v10_main.py`：主循环，负责 universe、WS、候选过滤、风控
-- `hermes_v10_signals.py`：信号层，当前以 `BR` 为主，`FR / MR / TF / LIQ` 保留为禁用或兼容
-- `hermes_v10_executor.py`：下单、持仓监控、平仓、结算
-- `hermes_v10_brain.py`：在线学习、Kelly、信号统计
-- `manage_v10.sh`：启动、停止、状态、日志、统计
+- `hermes_v10_main.py` - async engine, universe refresh, risk gates, routing
+- `hermes_v10_signals.py` - signal layer; `BR` is active, legacy families are disabled or compatibility-only
+- `hermes_v10_executor.py` - order placement, position monitoring, settlement
+- `hermes_v10_brain.py` - online learning, Kelly sizing, per-signal statistics
+- `manage_v10.sh` - server lifecycle and inspection commands
+- `test_v10_brain.py` - smoke tests for the learning layer
 
-## 运行要求
+## Runtime Requirements
 
 - Python 3.11
-- OKX 配置文件：`~/.okx/config.toml`
-- 需要可访问 OKX 公共/私有接口
+- OKX credentials at `~/.okx/config.toml`
+- Network access to OKX REST and WebSocket endpoints
 
-## 本地验证
+## Validation
 
 ```bash
 /root/.local/bin/python3.11 -B -c "import py_compile, tempfile, os; files=['hermes_v10_main.py','hermes_v10_executor.py','hermes_v10_brain.py','hermes_v10_signals.py','test_v10_brain.py']; tmp=tempfile.gettempdir(); [py_compile.compile(f, cfile=os.path.join(tmp, os.path.basename(f)+'.pyc'), doraise=True) for f in files]; print('compiled', len(files))"
 /root/.local/bin/python3.11 test_v10_brain.py
 ```
 
-## 服务器启动
-
-```bash
-./manage_v10.sh start
-./manage_v10.sh status
-./manage_v10.sh logs
-```
-
-## 管理命令
+## Server Commands
 
 ```bash
 ./manage_v10.sh start
@@ -40,22 +34,24 @@ Hermes 是一个基于 OKX 永续合约的自适应交易机器人。
 ./manage_v10.sh restart
 ./manage_v10.sh status
 ./manage_v10.sh logs
-./manage_v10.sh tail
 ./manage_v10.sh stats
 ./manage_v10.sh brain
 ./manage_v10.sh trades
 ```
 
-## 策略说明
+## Strategy Notes
 
-- 主信号：`BR`
-- `FR` 仅保留为实验参考，不再作为主开仓入口
-- 大脑文件使用新版本，避免旧统计污染
-- 日内亏损刹车、持仓数上限、总暴露上限、冷却期都已启用
+- Primary signal: `BR`
+- `FR` is no longer used as a main entry alpha
+- `BR` is tracked separately from `MR`
+- New learning files use the `hermes_v11_*` prefix to avoid old-label pollution
+- Daily loss brake, total exposure cap, same-direction cap, and cooldowns remain active
+- Small accounts can upsize a passing signal to the minimum OKX lot when the normal Kelly fraction is too small, while still respecting total exposure headroom
 
-## 备注
+## Cold Start
 
-如果需要完全冷启动，可以先确认当前无持仓，再执行：
+Only reset when there are no open positions and you intentionally want to clear
+runtime state:
 
 ```bash
 ./manage_v10.sh reset
