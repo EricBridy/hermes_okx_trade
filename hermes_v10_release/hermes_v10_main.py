@@ -15,7 +15,7 @@ Architecture:
                           ▼
   ┌──────────────────────────────────────────────────────────────┐
   │ Periodic tasks                                               │
-  │   - every 60s : refresh funding rates    → FundingRateSignal │
+  │   - every 60s : refresh funding cache for settlement checks  │
   │   - every 5min: scan top universe by 30M  → MeanReversionSig │
   │   - every 30s : monitor positions, time stops                │
   │   - every 60s : universe + ATR refresh                       │
@@ -64,8 +64,6 @@ from hermes_v10_okx import OKXRest, OKXWebSocket, WS_PUBLIC
 from hermes_v10_signals import (
     BreakRetestCandidate,
     BreakRetestSignal,
-    FundingRateCandidate,
-    FundingRateSignal,
     LiquidationCandidate,
     LiquidationSignal,
     MeanReversionCandidate,
@@ -91,15 +89,16 @@ SKIP_SYMBOLS = {"RLS-USDT-SWAP", "BILL-USDT-SWAP"}
 PRE_SETTLEMENT_BUFFER_MIN = 12   # 距下次资金费率结算 < 12 分钟时，禁开新仓
 NEXT_FUNDING_TIME_TTL = 300      # nextFundingTime 缓存 5 分钟（OKX 切换周期罕见）
 MAX_DAILY_TRADES = 40           # 之前 25 太严，63 笔/27h 撞上限错过极端信号
+MAX_DAILY_LOSS_PCT = 0.02
+MAX_DAILY_LOSS_FLOOR_USD = 0.50
 MAX_CONSECUTIVE_LOSSES = 5      # 之前 4，给 42% 胜率的策略多点容错
 LOSS_PAUSE_SEC = 1800
 SCAN_30M_INTERVAL = 300        # MR scan every 5 min
-SCAN_FR_INTERVAL = 60          # FR poll every 60s
 MONITOR_INTERVAL = 15          # position monitoring tick
 UNIVERSE_REFRESH_INTERVAL = 600  # rebuild watchlist every 10 min
 PRICE_STALE_AFTER = 30         # if no tick for 30s, skip the candidate
-BRAIN_FILE = os.path.join(SCRIPT_DIR, "hermes_v10_brain.json")
-TRADES_JSONL = os.path.join(SCRIPT_DIR, "hermes_v10_trades.jsonl")
+BRAIN_FILE = os.path.join(SCRIPT_DIR, "hermes_v11_brain.json")
+TRADES_JSONL = os.path.join(SCRIPT_DIR, "hermes_v11_trades.jsonl")
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +125,11 @@ class Engine:
         # OKX symbols can have 1h/2h/4h/8h periods, possibly auto-switched,
         # so we ALWAYS check via API rather than hardcoding UTC schedule.
         self._next_funding_cache: Dict[str, Dict[str, float]] = {}
-        # Daily counter
-        self.daily = {"date": "", "count": 0}
+        # Daily trade/risk bucket. Persist it so a restart does not erase a
+        # losing day and immediately reopen risk.
+        self.daily = self.state.setdefault(
+            "daily_risk", {"date": "", "count": 0, "pnl": 0.0}
+        )
         # Track whether we have started
         self._stop = asyncio.Event()
         self.executor = Executor(
@@ -140,7 +142,6 @@ class Engine:
         # so updates propagate without any extra plumbing.
         self.liq_signal = LiquidationSignal(self._on_liq_candidate,
                                             instruments=self.instruments)
-        self.fr_signal = FundingRateSignal(self._on_fr_candidate_unused_async)
         self.mr_signal = MeanReversionSignal(self._on_mr_candidate)
         self.tf_signal = TrendFollowSignal(self._on_tf_candidate)
         self.br_signal = BreakRetestSignal(self._on_br_candidate)
@@ -161,7 +162,7 @@ class Engine:
             f"hard SL={HARD_SL_PCT*100:.1f}%  trail@+{TRAIL_ACTIVATE_PCT*100:.1f}%")
         log(f" max concurrent={MAX_CONCURRENT}  max total exposure={MAX_TOTAL_EXPOSURE:.0%}  "
             f"max same direction={MAX_SAME_DIRECTION}")
-        log(f" signals: B&R (Break & Retest) + FR (REST 60s)  [MR/TF/LIQ disabled]")
+        log(" signals: BR (Break & Retest) primary  [FR/MR/TF/LIQ disabled]")
         log(f" universe top {UNIVERSE_TOP_N}, min24hVol=${MIN_24H_VOL_USD/1e6:.1f}M")
         log("=" * 64)
         # Instruments cache
@@ -209,6 +210,7 @@ class Engine:
                     p_win=safe_float(meta.get("p_win"), 0.5),
                     ev=safe_float(meta.get("ev"), 0.0),
                     fraction=safe_float(meta.get("fraction"), 0.0),
+                    setup=meta.get("setup", {}),
                 )
                 self.executor.positions[iid] = p
                 log(f"    {iid} {direction} {p.sz}lots @ ${avg}")
@@ -312,30 +314,37 @@ class Engine:
             return max(1, delta_ms // 60000)
         return None
 
-    def _check_daily_limit(self) -> bool:
+    def _refresh_daily_bucket(self) -> None:
         today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
         if self.daily["date"] != today:
-            self.daily = {"date": today, "count": 0}
+            self.daily = {"date": today, "count": 0, "pnl": 0.0}
+            self.state["daily_risk"] = self.daily
+
+    def _check_daily_limit(self) -> bool:
+        self._refresh_daily_bucket()
         return self.daily["count"] >= MAX_DAILY_TRADES
+
+    async def _check_daily_loss_limit(self) -> Optional[str]:
+        self._refresh_daily_bucket()
+        pnl = safe_float(self.daily.get("pnl"), 0.0)
+        if pnl >= 0:
+            return None
+        balance = await self.executor.get_balance()
+        limit = max(MAX_DAILY_LOSS_FLOOR_USD, balance * MAX_DAILY_LOSS_PCT)
+        if abs(pnl) >= limit:
+            return f"daily loss brake pnl=${pnl:+.4f} limit=${limit:.4f}"
+        return None
 
     async def _can_open(self, inst_id: str, candidate: Optional[Dict[str, Any]] = None
                         ) -> Optional[str]:
         """
         Returns reason string if cannot open, None if can open.
-        Some "super-extreme" candidates (very high z-score on FR or LIQ) are
-        allowed to bypass the daily limit, since those signals are rare and
-        historically high-edge — missing them costs more than the marginal
-        cost of one extra trade.
         """
-        is_super_extreme = False
-        if candidate:
-            sig = candidate.get("signal_type")
-            if sig == "FR" and abs(candidate.get("fr_abs_z", 0)) >= 3.0:
-                is_super_extreme = True
-            elif sig == "LIQ" and abs(candidate.get("liq_size_z", 0)) >= 4.0:
-                is_super_extreme = True
-        if self._check_daily_limit() and not is_super_extreme:
+        if self._check_daily_limit():
             return "daily limit reached"
+        daily_loss_reason = await self._check_daily_loss_limit()
+        if daily_loss_reason:
+            return daily_loss_reason
         if self.brain.is_symbol_cold(inst_id):
             return "symbol cold"
         last_close = self.state.get("last_trade", {}).get(inst_id, 0)
@@ -405,7 +414,9 @@ class Engine:
         opened = await self.executor.open_position(candidate, evaluation, cap)
         if opened:
             self.daily["count"] += 1
+            self.state["daily_risk"] = self.daily
             self.state.setdefault("last_trade", {})[iid] = time.time()
+            save_state(self.state, self.executor.positions)
 
     async def _enrich_candidate(self, c: Dict[str, Any]) -> None:
         iid = c["instId"]
@@ -468,10 +479,6 @@ class Engine:
             f"long=${lc.liq_long_usd:,.0f} short=${lc.liq_short_usd:,.0f}")
         await self._process_candidate(c)
 
-    async def _on_fr_candidate_unused_async(self, fc: Any) -> None:
-        # Not used: FR signal is polled and processed in tick loop
-        return
-
     async def _on_mr_candidate(self, mc: MeanReversionCandidate) -> None:
         c = {
             "instId": mc.inst_id,
@@ -492,10 +499,14 @@ class Engine:
     async def _on_br_candidate(self, bc: BreakRetestCandidate) -> None:
         c = {
             "instId": bc.inst_id,
-            "signal_type": "MR",  # Reuse brain features (direction-aware)
+            "signal_type": "BR",
             "direction": bc.direction,
-            "mr_zscore": 0.0,
-            "bb_position": 0.0,
+            "breakout_bar_idx": bc.breakout_bar_idx,
+            "retest_distance_pct": bc.retest_distance_pct,
+            "confirmation": bc.confirmation,
+            "br_level": bc.level,
+            "br_adx": bc.adx,
+            "br_regime": bc.regime,
             "atr_pct": bc.atr_pct,
             "atr_abs": self.atr_abs.get(bc.inst_id, 0.0),
         }
@@ -506,45 +517,6 @@ class Engine:
     # ---------------------------------------------------------------
     # Periodic loops
     # ---------------------------------------------------------------
-
-    async def _loop_funding_rates(self) -> None:
-        while not self._stop.is_set():
-            try:
-                # Sample top-N to keep request count reasonable. We use the
-                # full payload so we can populate _next_funding_cache for
-                # free, avoiding a second API call inside _is_near_settlement.
-                for iid in list(self.universe)[:30]:
-                    row = await asyncio.to_thread(self.rest.funding_rate_full, iid)
-                    if not row:
-                        continue
-                    try:
-                        next_t = int(row.get("nextFundingTime") or 0)
-                        if next_t > 0:
-                            self._next_funding_cache[iid] = {
-                                "fetched_at": time.time(),
-                                "next_funding_ms": next_t,
-                            }
-                        fr = float(row.get("fundingRate") or 0)
-                    except (TypeError, ValueError):
-                        continue
-                    cand = self.fr_signal.update(iid, fr,
-                                                regime=self._regime_cache.get(iid, REGIME_NEUTRAL))
-                    if cand:
-                        c = {
-                            "instId": cand.inst_id,
-                            "signal_type": "FR",
-                            "direction": cand.direction,
-                            "fr": cand.fr,
-                            "fr_abs_z": cand.fr_abs_z,
-                            "atr_pct": self.atr_pct.get(iid, 1.0),
-                            "atr_abs": self.atr_abs.get(iid, 0.0),
-                        }
-                        log(f"  💸 FR extreme {iid} {cand.direction} "
-                            f"FR={cand.fr*100:+.4f}% z={cand.fr_abs_z:.1f}")
-                        await self._process_candidate(c)
-            except Exception as e:
-                log(f"  fr loop error: {e}")
-            await asyncio.sleep(SCAN_FR_INTERVAL)
 
     async def _loop_mr_scan(self) -> None:
         # First scan delayed slightly to let universe populate
@@ -563,7 +535,7 @@ class Engine:
                     if a is not None and closes[-1] > 0:
                         self.atr_abs[iid] = a
                         self.atr_pct[iid] = a / closes[-1] * 100.0
-                    # Compute regime for this symbol (used by FR signal too)
+                    # Compute regime for this symbol (used by settlement gates)
                     adx_result = adx_di(highs, lows, closes, 14)
                     if adx_result:
                         adx_val = adx_result[0]
@@ -601,7 +573,12 @@ class Engine:
                         continue
                     reason = await self.executor.monitor_position(p, last)
                     if reason:
+                        before_pnl = safe_float(self.state.get("total_pnl"), 0.0)
                         await self.executor.close_and_settle(iid, reason)
+                        realized = safe_float(self.state.get("total_pnl"), 0.0) - before_pnl
+                        self._refresh_daily_bucket()
+                        self.daily["pnl"] = safe_float(self.daily.get("pnl"), 0.0) + realized
+                        self.state["daily_risk"] = self.daily
                         # consecutive loss check
                         cl = self.state.get("consecutive_losses", 0)
                         if cl >= MAX_CONSECUTIVE_LOSSES:
@@ -628,6 +605,7 @@ class Engine:
                 bal = await self.executor.get_balance()
                 log(f"  📡 status bal=${bal:.2f}  pos={len(self.executor.positions)}/{MAX_CONCURRENT}  "
                     f"daily={self.daily['count']}/{MAX_DAILY_TRADES}  "
+                    f"dayPnL=${safe_float(self.daily.get('pnl'), 0.0):+.4f}  "
                     f"univ={len(self.universe)}")
                 log(f"  {self.brain.status_str()}")
                 self.brain.save()
@@ -650,7 +628,6 @@ class Engine:
                 pass
         ws_task = asyncio.create_task(self.ws_public.run())
         tasks = [
-            asyncio.create_task(self._loop_funding_rates()),
             asyncio.create_task(self._loop_mr_scan()),
             asyncio.create_task(self._loop_monitor_positions()),
             asyncio.create_task(self._loop_universe_refresh()),

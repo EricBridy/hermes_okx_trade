@@ -7,15 +7,16 @@ Hermes v10 — Strategy Brain
 Self-iterating learning core for the v10 trading strategy. Pure Python,
 no exchange dependencies, fully unit-testable.
 
-Three signal types that the brain receives at evaluation time:
+Signal types that the brain receives at evaluation time:
     LIQ : liquidation-cascade reversal
-    FR  : extreme funding-rate contrarian (8h cycle)
+    FR  : extreme funding-rate contrarian (experimental)
     MR  : 30-minute mean reversion
+    BR  : break & retest continuation
 
-Each candidate trade is described by a 16-D feature vector. A single
+Each candidate trade is described by a fixed feature vector. A single
 unified online logistic regression (SGD + L2) learns p_win across all
-three signal types — the one-hot signal-type features let the model
-discover that, e.g., microprice_bias matters more for LIQ than for FR.
+signal types — the one-hot signal-type features let the model discover
+which family is working and which one is not.
 
 Why one model not three:
     Three small datasets with imbalanced flow (LIQ events are rare,
@@ -51,29 +52,36 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # Tunables
 # ----------------------------------------------------------------------
 
-FEATURE_VERSION = 1
+FEATURE_VERSION = 2
 
 FEATURE_NAMES: Tuple[str, ...] = (
     # 0-2  : market context (always populated)
     "atr_pct",          # 5m ATR / price, scaled to ~[0, 1]
     "hour_sin",         # cyclic time of day (UTC+8)
     "hour_cos",
-    # 3-5  : signal type one-hot (mutually exclusive)
+    # 3-6  : signal type one-hot (mutually exclusive)
     "is_liq",
     "is_fr",
     "is_mr",
-    # 6    : trade direction (sign-aware downstream features)
+    "is_br",
+    # 7    : trade direction (sign-aware downstream features)
     "dir_long",         # +1 for long, -1 for short
-    # 7-9  : LIQ-only features (zero when is_liq=0)
+    # 8-10 : LIQ-only features (zero when is_liq=0)
     "liq_size_z",       # 60s cumulative liq size, z-score vs 24h baseline
     "liq_imbalance",    # direction-aware: positive when reversal favours us
     "price_drop_atr",   # how far has price moved during cascade, in ATRs
-    # 10   : FR-only feature (zero when is_fr=0)
+    # 11   : FR-only feature (zero when is_fr=0)
     "fr_abs_z",         # |FR| z-score vs symbol's |FR| history
-    # 11-12: MR-only features (zero when is_mr=0)
+    # 12-13: MR-only features (zero when is_mr=0)
     "mr_zscore",        # direction-aware: +ve when entering against deviation
     "bb_position",      # price's location in 30M Bollinger band, [-1, 1]
-    # 13-15: microstructure (always populated)
+    # 14-18: BR-only features (zero when is_br=0)
+    "br_breakout_age",  # recentness of breakout, scaled to [0, 1]
+    "br_retest_tight",  # closeness of retest to the broken level, [0, 1]
+    "br_pin_bar",
+    "br_engulfing",
+    "br_strong_body",
+    # 19-21: microstructure (always populated)
     "microprice_bias",  # direction-aware
     "l2_imbalance",     # direction-aware
     "taker_buy_ratio",  # direction-aware
@@ -82,7 +90,7 @@ NUM_FEATURES = len(FEATURE_NAMES)
 
 DEFAULT_BRAIN_FILE = os.environ.get(
     "HERMES_V10_BRAIN_FILE",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "hermes_v10_brain.json"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "hermes_v11_brain.json"),
 )
 
 # ----------------------------------------------------------------------
@@ -122,7 +130,7 @@ class FeatureExtractor:
     Highly tolerant of missing fields (they become zeros).
 
     Expected candidate keys:
-        signal_type      "LIQ" / "FR" / "MR"             required
+        signal_type      "LIQ" / "FR" / "MR" / "BR"      required
         direction        "LONG" / "SHORT"                required
         atr_pct          5m ATR percent                  optional
         # LIQ:
@@ -136,6 +144,10 @@ class FeatureExtractor:
         # MR:
         mr_zscore        float (signed: + above mean)
         bb_position      float in [-1, 1]
+        # BR:
+        breakout_bar_idx int (bars since breakout)
+        retest_distance_pct float
+        confirmation     str ("pin_bar" / "engulfing" / "strong_body")
         # microstructure:
         microprice       float
         mid_price        float
@@ -156,6 +168,7 @@ class FeatureExtractor:
         f["is_liq"] = 1.0 if sig == "LIQ" else 0.0
         f["is_fr"] = 1.0 if sig == "FR" else 0.0
         f["is_mr"] = 1.0 if sig == "MR" else 0.0
+        f["is_br"] = 1.0 if sig == "BR" else 0.0
 
         # ----- Common: ATR + cyclic time -----
         atr = safe_float(c.get("atr_pct"))
@@ -198,6 +211,19 @@ class FeatureExtractor:
             f["mr_zscore"] = clip(-d * zs / 3.0, -1.0, 1.0)
             bbp = safe_float(c.get("bb_position"))
             f["bb_position"] = clip(-d * bbp, -1.0, 1.0)
+
+        # ----- BR features -----
+        if sig == "BR":
+            age = safe_float(c.get("breakout_bar_idx"))
+            f["br_breakout_age"] = clip(1.0 - age / 10.0, 0.0, 1.0)
+
+            retest = safe_float(c.get("retest_distance_pct"))
+            f["br_retest_tight"] = clip(1.0 - retest / 1.0, 0.0, 1.0)
+
+            conf = (c.get("confirmation") or "").lower()
+            f["br_pin_bar"] = 1.0 if conf == "pin_bar" else 0.0
+            f["br_engulfing"] = 1.0 if conf == "engulfing" else 0.0
+            f["br_strong_body"] = 1.0 if conf == "strong_body" else 0.0
 
         # ----- Common: microstructure -----
         mp = safe_float(c.get("microprice"))
@@ -486,7 +512,8 @@ class PerformanceTracker:
     def __init__(self) -> None:
         self.symbol_state: Dict[str, Dict[str, Any]] = {}
         self.by_signal: Dict[str, Dict[str, float]] = {
-            s: {"wins": 0.0, "losses": 0.0, "pnl": 0.0} for s in ("LIQ", "FR", "MR")
+            s: {"wins": 0.0, "losses": 0.0, "pnl": 0.0}
+            for s in ("LIQ", "FR", "MR", "BR")
         }
 
     def is_cold(self, symbol: str) -> bool:
@@ -527,7 +554,7 @@ class PerformanceTracker:
 
     def status_str(self) -> str:
         parts = []
-        for sig in ("LIQ", "FR", "MR"):
+        for sig in ("BR", "MR", "FR", "LIQ"):
             n, wr = self.signal_winrate(sig)
             parts.append(f"{sig}={int(self.by_signal[sig]['wins'])}/{n}({wr*100:.0f}%)")
         cold = sum(1 for s in self.symbol_state.values()
@@ -539,7 +566,7 @@ class PerformanceTracker:
 
     def from_dict(self, d: Dict[str, Any]) -> None:
         self.symbol_state = d.get("symbol_state", {})
-        for s in ("LIQ", "FR", "MR"):
+        for s in ("LIQ", "FR", "MR", "BR"):
             if s in d.get("by_signal", {}):
                 self.by_signal[s] = d["by_signal"][s]
 
@@ -552,7 +579,7 @@ class PerformanceTracker:
 @dataclass
 class TradeRecord:
     symbol: str
-    signal_type: str               # "LIQ" / "FR" / "MR"
+    signal_type: str               # "LIQ" / "FR" / "MR" / "BR"
     direction: str                 # "LONG" / "SHORT"
     entry_price: float
     exit_price: float
@@ -603,7 +630,7 @@ class StrategyBrain:
     ) -> None:
         self.brain_file = brain_file
         self.trades_jsonl = trades_jsonl or os.path.join(
-            os.path.dirname(brain_file), "hermes_v10_trades.jsonl"
+            os.path.dirname(brain_file), "hermes_v11_trades.jsonl"
         )
         self.min_edge = min_edge
         self.fe = FeatureExtractor()
@@ -614,24 +641,35 @@ class StrategyBrain:
         self._dirty = False
         self._load()
 
+    def _reset_runtime_state(self) -> None:
+        self.model = OnlineLogReg()
+        self.kelly = KellySizer()
+        self.tracker = PerformanceTracker()
+
     # -------- persistence --------
     def _load(self) -> None:
         try:
             if os.path.exists(self.brain_file):
                 with open(self.brain_file, "r", encoding="utf-8") as f:
                     d = json.load(f)
+                if d.get("version") != FEATURE_VERSION:
+                    self._reset_runtime_state()
+                    return
                 if not self.model.from_dict(d.get("model", {})):
-                    self.model = OnlineLogReg()
+                    self._reset_runtime_state()
+                    return
                 self.kelly.from_dict(d.get("kelly", {}))
                 self.tracker.from_dict(d.get("tracker", {}))
         except Exception:
-            pass
+            self._reset_runtime_state()
 
     def save(self, force: bool = False) -> None:
         if not force and time.time() - self.last_save < 30 and not self._dirty:
             return
         try:
-            os.makedirs(os.path.dirname(self.brain_file), exist_ok=True)
+            brain_dir = os.path.dirname(self.brain_file)
+            if brain_dir:
+                os.makedirs(brain_dir, exist_ok=True)
             data = {
                 "version": FEATURE_VERSION,
                 "saved_at": time.time(),
@@ -642,7 +680,15 @@ class StrategyBrain:
             tmp = self.brain_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.brain_file)
+            try:
+                os.replace(tmp, self.brain_file)
+            except Exception:
+                with open(self.brain_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
             self.last_save = time.time()
             self._dirty = False
         except Exception:

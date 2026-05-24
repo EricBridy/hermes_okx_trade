@@ -88,11 +88,20 @@ def load_state() -> Dict[str, Any]:
 def save_state(state: Dict[str, Any], positions: Dict[str, "Position"]) -> None:
     state["position_meta"] = {pid: p.to_meta() for pid, p in positions.items()}
     try:
-        os.makedirs(SCRIPT_DIR, exist_ok=True)
+        if SCRIPT_DIR:
+            os.makedirs(SCRIPT_DIR, exist_ok=True)
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, default=str)
-        os.replace(tmp, STATE_FILE)
+        try:
+            os.replace(tmp, STATE_FILE)
+        except Exception:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, default=str)
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
     except Exception as e:
         log(f"⚠️ save_state: {e}")
 
@@ -105,7 +114,7 @@ def save_state(state: Dict[str, Any], positions: Dict[str, "Position"]) -> None:
 @dataclass
 class Position:
     inst_id: str
-    signal_type: str           # LIQ / FR / MR
+    signal_type: str           # LIQ / FR / MR / BR
     direction: str             # LONG / SHORT
     entry_price: float
     sz: int                    # number of contracts
@@ -123,6 +132,7 @@ class Position:
     p_win: float = 0.5
     ev: float = 0.0
     fraction: float = 0.0
+    setup: Dict[str, Any] = field(default_factory=dict)
 
     def to_meta(self) -> Dict[str, Any]:
         return {
@@ -134,6 +144,7 @@ class Position:
             "ev": self.ev,
             "fraction": self.fraction,
             "features": self.features,
+            "setup": self.setup,
         }
 
 
@@ -285,6 +296,13 @@ class Executor:
         log(f"  ✅ [{candidate.get('signal_type')}] {direction} {inst_id} "
             f"{sz}lots @ ${avg} TP=${tp} SL=${sl} "
             f"f={evaluation['fraction']:.0%} p={evaluation['p_win']:.2%}")
+        setup_keys = (
+            "br_level", "breakout_bar_idx", "retest_distance_pct",
+            "confirmation", "br_adx", "br_regime", "atr_pct", "atr_abs",
+            "mr_zscore", "bb_position", "fr", "fr_abs_z",
+            "liq_size_z", "price_drop_atr",
+        )
+        setup = {k: candidate[k] for k in setup_keys if k in candidate}
         pos = Position(
             inst_id=inst_id, signal_type=candidate.get("signal_type", "?"),
             direction=direction, entry_price=avg, sz=sz,
@@ -294,6 +312,7 @@ class Executor:
             lowest_price=avg if direction == "SHORT" else 1e18,
             features=evaluation["features"], p_win=evaluation["p_win"],
             ev=evaluation["ev"], fraction=evaluation["fraction"],
+            setup=setup,
         )
         async with self._lock:
             self.positions[inst_id] = pos
@@ -439,6 +458,7 @@ class Executor:
             extra={
                 "highest_pnl_pct": p.highest_pnl_pct,
                 "lowest_pnl_pct": p.lowest_pnl_pct,
+                "setup": p.setup,
             },
         )
         diag = self.brain.record_trade(rec)

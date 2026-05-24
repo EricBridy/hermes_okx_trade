@@ -14,8 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MAIN_PY="$SCRIPT_DIR/hermes_v10_main.py"
 STDOUT_LOG="$SCRIPT_DIR/hermes_v10_stdout.log"
 TRADES_LOG="$SCRIPT_DIR/hermes_v10_trades.log"
-TRADES_JSONL="$SCRIPT_DIR/hermes_v10_trades.jsonl"
-BRAIN_FILE="$SCRIPT_DIR/hermes_v10_brain.json"
+TRADES_JSONL="$SCRIPT_DIR/hermes_v11_trades.jsonl"
+BRAIN_FILE="$SCRIPT_DIR/hermes_v11_brain.json"
 STATE_FILE="$SCRIPT_DIR/hermes_v10_state.json"
 PID_FILE="$SCRIPT_DIR/hermes_v10.pid"
 
@@ -258,7 +258,7 @@ if losses:
 
 print()
 print('  --- 各信号源表现 ---')
-for sig in ('LIQ', 'FR', 'MR'):
+for sig in ('LIQ', 'FR', 'MR', 'BR'):
     rs = [r for r in recs if r.get('signal_type') == sig]
     if not rs:
         print(f\"  {sig}: 暂无交易\")
@@ -300,9 +300,11 @@ print(f\"  Brier 均值:   {sum(rb)/len(rb):.3f} (50笔窗口)\")
 print()
 print('  --- 特征权重（按绝对值排序）---')
 NAMES = [
-    'atr_pct','hour_sin','hour_cos','is_liq','is_fr','is_mr','dir_long',
+    'atr_pct','hour_sin','hour_cos','is_liq','is_fr','is_mr','is_br','dir_long',
     'liq_size_z','liq_imbalance','price_drop_atr','fr_abs_z','mr_zscore',
-    'bb_position','microprice_bias','l2_imbalance','taker_buy_ratio'
+    'bb_position','br_breakout_age','br_retest_tight','br_pin_bar',
+    'br_engulfing','br_strong_body','microprice_bias','l2_imbalance',
+    'taker_buy_ratio'
 ]
 weights = list(zip(NAMES, m.get('w', [0]*len(NAMES))))
 for n, w in sorted(weights, key=lambda x: abs(x[1]), reverse=True):
@@ -322,7 +324,7 @@ print(f\"  累计胜负:     {k.get('win_count',0):.1f} / {k.get('loss_count',0)
 
 print()
 print('  --- 各信号源历史 ---')
-for sig in ('LIQ', 'FR', 'MR'):
+for sig in ('LIQ', 'FR', 'MR', 'BR'):
     bs = t.get('by_signal', {}).get(sig, {})
     w = bs.get('wins', 0)
     l = bs.get('losses', 0)

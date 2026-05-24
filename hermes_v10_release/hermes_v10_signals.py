@@ -360,13 +360,14 @@ class BreakRetestSignal:
                     if confirmation:
                         # EMIT!
                         self._last_emit[inst_id] = now
+                        breakout_age = state.get("bars_waited", 0)
                         state = {"phase": "IDLE"}
                         self._states[inst_id] = state
                         cand = BreakRetestCandidate(
                             inst_id=inst_id,
                             direction=direction,
                             level=level,
-                            breakout_bar_idx=state.get("bars_waited", 0),
+                            breakout_bar_idx=breakout_age,
                             retest_distance_pct=distance_pct,
                             confirmation=confirmation,
                             atr_pct=atr_pct,

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 import random
-import tempfile
 import time
 
 from hermes_v10_brain import (
@@ -30,11 +29,11 @@ def t_safe_features():
     assert len(f) == NUM_FEATURES
     assert all(isinstance(v, float) for v in f.values())
 
-    # All three signal types
-    for sig in ("LIQ", "FR", "MR"):
+    # All signal types
+    for sig in ("LIQ", "FR", "MR", "BR"):
         f = FeatureExtractor.build({"signal_type": sig, "direction": "LONG"})
         assert f[f"is_{sig.lower()}"] == 1.0
-        for other in ("LIQ", "FR", "MR"):
+        for other in ("LIQ", "FR", "MR", "BR"):
             if other != sig:
                 assert f[f"is_{other.lower()}"] == 0.0
 
@@ -68,6 +67,20 @@ def t_safe_features():
     assert fm["mr_zscore"] > 0    # -d * z = -(-1)*2.5 = +2.5
     assert fm["bb_position"] > 0  # -d * 0.9 = +0.9
     print(f"  MR-SHORT fade: zs={fm['mr_zscore']:+.2f} bb={fm['bb_position']:+.2f}")
+
+    br = {
+        "signal_type": "BR", "direction": "LONG",
+        "breakout_bar_idx": 2,
+        "retest_distance_pct": 0.2,
+        "confirmation": "pin_bar",
+        "atr_pct": 1.1,
+    }
+    fb = FeatureExtractor.build(br)
+    assert fb["is_br"] == 1.0
+    assert fb["br_breakout_age"] > 0.7
+    assert fb["br_retest_tight"] > 0.7
+    assert fb["br_pin_bar"] == 1.0
+    print(f"  BR-LONG retest: age={fb['br_breakout_age']:.2f} tight={fb['br_retest_tight']:.2f}")
 
     print("  OK")
 
@@ -118,25 +131,26 @@ def t_tracker():
     t.record(sym, "LIQ", -1.0)
     assert t.is_cold(sym)
     t.record("OTHER", "FR", 0.5)
+    t.record("OTHER2", "BR", 0.2)
     print(f"  {t.status_str()}")
     print("  OK")
 
 
 def t_brain_end_to_end():
     section("StrategyBrain end-to-end")
-    with tempfile.TemporaryDirectory() as tmp:
-        bf = os.path.join(tmp, "brain.json")
-        tl = os.path.join(tmp, "trades.jsonl")
+    bf = os.path.abspath("brain_test_tmp.json")
+    tl = os.path.abspath("trades_test_tmp.jsonl")
+    try:
         b = StrategyBrain(brain_file=bf, trades_jsonl=tl, min_edge=0.0001)
 
-        # Synthetic rule: LIQ cascade with strong reversal signals = win
+    # Synthetic rule: LIQ cascade with strong reversal signals = win
         random.seed(11)
         for _ in range(60):
             cand = {
                 "signal_type": "LIQ",
-                "direction": random.choice(["LONG", "SHORT"]),
-                "atr_pct": 1.0,
-                "liq_size_z": random.uniform(0, 5),
+            "direction": random.choice(["LONG", "SHORT"]),
+            "atr_pct": 1.0,
+            "liq_size_z": random.uniform(0, 5),
                 "liq_long_usd": random.uniform(0, 1_000_000),
                 "liq_short_usd": random.uniform(0, 1_000_000),
                 "price_drop_atr": random.uniform(-3, 3),
@@ -144,9 +158,9 @@ def t_brain_end_to_end():
                 "mid_price": 100.0,
                 "l2_bid_size": random.uniform(500, 2500),
                 "l2_ask_size": random.uniform(500, 2500),
-                "taker_buy_5m": random.uniform(100_000, 1_000_000),
-                "taker_sell_5m": random.uniform(100_000, 1_000_000),
-            }
+            "taker_buy_5m": random.uniform(100_000, 1_000_000),
+            "taker_sell_5m": random.uniform(100_000, 1_000_000),
+        }
             ev = b.evaluate(cand)
             f = ev["features"]
             # Simulate: win when both liq_imbalance>0 AND microprice_bias>0
@@ -173,12 +187,37 @@ def t_brain_end_to_end():
         assert wd["liq_imbalance"] > 0
         assert wd["microprice_bias"] > 0
 
+        br_ev = b.evaluate({
+            "signal_type": "BR",
+            "direction": "LONG",
+            "atr_pct": 1.0,
+            "breakout_bar_idx": 2,
+            "retest_distance_pct": 0.2,
+            "confirmation": "engulfing",
+            "br_level": 100.0,
+            "br_adx": 28.0,
+            "br_regime": "TREND",
+            "microprice": 100.1,
+            "mid_price": 100.0,
+            "l2_bid_size": 2000,
+            "l2_ask_size": 1000,
+            "taker_buy_5m": 500000,
+            "taker_sell_5m": 250000,
+        })
+        assert br_ev["features"]["is_br"] == 1.0
+
         # Round-trip persistence
         b.save(force=True)
         b2 = StrategyBrain(brain_file=bf, trades_jsonl=tl)
         for w1, w2 in zip(b.model.w, b2.model.w):
-            assert abs(w1 - w2) < 1e-9
+            assert abs(w1 - w2) < 1e-12
         print("  reload OK")
+    finally:
+        for path in (bf, tl):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 
 def main():
